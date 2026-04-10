@@ -595,7 +595,9 @@ class MCPOperationsMixin:
             try:
                 await server._subscription_registry.add(session_id, pattern)
             except ValueError as e:
-                rejected.append(RejectedTopic(pattern=pattern, reason=f"invalid_pattern: {e}"))
+                rejected.append(
+                    RejectedTopic(pattern=pattern, reason=f"invalid_pattern: {e}")
+                )
                 continue
             subscribed.append(SubscribedTopic(pattern=pattern))
 
