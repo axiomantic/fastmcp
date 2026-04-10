@@ -26,9 +26,7 @@ PaginateT = TypeVar("PaginateT")
 
 def _is_placeholder(segment: str) -> bool:
     """Return True if ``segment`` is a ``{param}`` placeholder."""
-    return (
-        len(segment) >= 2 and segment.startswith("{") and segment.endswith("}")
-    )
+    return len(segment) >= 2 and segment.startswith("{") and segment.endswith("}")
 
 
 def _placeholder_name(segment: str) -> str:
@@ -679,9 +677,7 @@ class MCPOperationsMixin:
         authorize_cb = self._event_topic_authorize.get(declared_pattern)
 
         if authorize_cb is not None:
-            topic_params = _extract_topic_params(
-                declared_segments, subscribe_segments
-            )
+            topic_params = _extract_topic_params(declared_segments, subscribe_segments)
             try:
                 return bool(authorize_cb(session_id, topic_params))
             except Exception:
@@ -705,9 +701,7 @@ class MCPOperationsMixin:
         """
         return bool(self._find_matching_declared_topics(pattern))
 
-    def _find_matching_declared_topics(
-        self: FastMCP, pattern: str
-    ) -> list[str]:
+    def _find_matching_declared_topics(self: FastMCP, pattern: str) -> list[str]:
         """Return the declared topic patterns that a subscription pattern matches.
 
         Handles both exact matches and wildcard patterns that could match

@@ -1769,9 +1769,7 @@ class TestAuthorizeCallback:
             return True
 
         mcp = FastMCP("test")
-        mcp.declare_event(
-            "sessions/{session_id}/messages", authorize=authorize
-        )
+        mcp.declare_event("sessions/{session_id}/messages", authorize=authorize)
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -1792,9 +1790,7 @@ class TestAuthorizeCallback:
 
 
 class TestTargetSessionIds:
-    async def _capture_session(
-        self, session: Any, sink: list[Any]
-    ) -> None:
+    async def _capture_session(self, session: Any, sink: list[Any]) -> None:
         async def capturing_send(
             notification: ServerNotification,
             related_request_id: str | int | None = None,
@@ -1818,9 +1814,7 @@ class TestTargetSessionIds:
             await self._capture_session(s1, sinks[s1_id])
 
             async with Client(mcp) as _c2:
-                s2 = next(
-                    s for s in mcp._active_sessions.values() if s is not s1
-                )
+                s2 = next(s for s in mcp._active_sessions.values() if s is not s1)
                 s2_id = getattr(s2, "_fastmcp_event_session_id")
                 await mcp._subscription_registry.add(s2_id, "public/topic")
                 sinks[s2_id] = []
@@ -1857,9 +1851,7 @@ class TestTargetSessionIds:
             await self._capture_session(s1, sinks[s1_id])
 
             async with Client(mcp) as _c2:
-                s2 = next(
-                    s for s in mcp._active_sessions.values() if s is not s1
-                )
+                s2 = next(s for s in mcp._active_sessions.values() if s is not s1)
                 s2_id = getattr(s2, "_fastmcp_event_session_id")
                 await mcp._subscription_registry.add(s2_id, "public/topic")
                 sinks[s2_id] = []
@@ -1920,9 +1912,7 @@ class TestTargetSessionIds:
             await self._capture_session(s1, sink_s1)
 
             async with Client(mcp) as _c2:
-                s2 = next(
-                    s for s in mcp._active_sessions.values() if s is not s1
-                )
+                s2 = next(s for s in mcp._active_sessions.values() if s is not s1)
                 s2_id = getattr(s2, "_fastmcp_event_session_id")
                 # s2 subscribes to a DIFFERENT topic
                 await mcp._subscription_registry.add(s2_id, "other/topic")
@@ -1958,9 +1948,7 @@ class TestTargetSessionIds:
 
             async with Client(mcp) as _c2:
                 s2 = next(
-                    s
-                    for s in mcp._active_sessions.values()
-                    if s is not caller_session
+                    s for s in mcp._active_sessions.values() if s is not caller_session
                 )
                 s2_id = getattr(s2, "_fastmcp_event_session_id")
                 await mcp._subscription_registry.add(s2_id, "public/topic")
@@ -2009,9 +1997,7 @@ class TestWildcardSmuggling:
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
-            result = await _subscribe_via_handler(
-                mcp, session, ["sessions/+/messages"]
-            )
+            result = await _subscribe_via_handler(mcp, session, ["sessions/+/messages"])
 
         assert result.subscribed == []
         assert len(result.rejected) == 1
