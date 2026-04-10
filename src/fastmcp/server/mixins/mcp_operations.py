@@ -592,7 +592,11 @@ class MCPOperationsMixin:
                 )
                 continue
 
-            await server._subscription_registry.add(session_id, pattern)
+            try:
+                await server._subscription_registry.add(session_id, pattern)
+            except ValueError as e:
+                rejected.append(RejectedTopic(pattern=pattern, reason=f"invalid_pattern: {e}"))
+                continue
             subscribed.append(SubscribedTopic(pattern=pattern))
 
             # Deliver retained values for this pattern (deduplicated)
@@ -718,11 +722,6 @@ class MCPOperationsMixin:
         from fastmcp.server.events import _pattern_to_regex
 
         matches: list[str] = []
-
-        # Direct match short-circuit
-        if pattern in self._event_topics:
-            matches.append(pattern)
-            return matches
 
         for declared_pattern in self._event_topics:
             # Forward: build regex from declared pattern's {param} placeholders

@@ -1978,6 +1978,132 @@ class TestTargetSessionIds:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# C1: Overlapping declarations - all must authorize
+# ---------------------------------------------------------------------------
+
+
+class TestOverlappingDeclarations:
+    async def test_overlapping_declarations_all_must_authorize(self):
+        """When a subscribe pattern matches multiple declarations, ALL must
+        authorize. Here ``myapp/events`` matches both the permissive literal
+        and the session-scoped parameterized declaration. The latter fails
+        authorization, so the subscription must be rejected."""
+        mcp = FastMCP("test")
+        # Permissive: no auth required
+        mcp.declare_event("myapp/events")
+        # Restrictive: session-scoped
+        mcp.declare_event("myapp/{session_id}")
+
+        async with Client(mcp) as _client:
+            session = _get_active_session(mcp)
+            result = await _subscribe_via_handler(mcp, session, ["myapp/events"])
+
+        # The {session_id} declaration also matches "myapp/events" (single
+        # segment in the param slot). Its default policy rejects because
+        # "events" != the subscriber's session_id.
+        assert result.subscribed == []
+        assert len(result.rejected) == 1
+        assert result.rejected[0].reason == "permission_denied"
+
+    async def test_exact_match_still_works_after_fix(self):
+        """A simple exact-match subscription with no overlapping declarations
+        continues to work after removing the early-return short-circuit."""
+        mcp = FastMCP("test")
+        mcp.declare_event("myapp/events")
+
+        async with Client(mcp) as _client:
+            session = _get_active_session(mcp)
+            result = await _subscribe_via_handler(mcp, session, ["myapp/events"])
+
+        assert len(result.subscribed) == 1
+        assert result.subscribed[0].pattern == "myapp/events"
+        assert result.rejected == []
+
+    async def test_overlapping_permissive_declarations_both_pass(self):
+        """Two overlapping permissive declarations both authorize, so the
+        subscription succeeds."""
+        mcp = FastMCP("test")
+        mcp.declare_event("myapp/events")
+        mcp.declare_event("myapp/{project}")  # non-magic param, permissive
+
+        async with Client(mcp) as _client:
+            session = _get_active_session(mcp)
+            result = await _subscribe_via_handler(mcp, session, ["myapp/events"])
+
+        assert len(result.subscribed) == 1
+        assert result.subscribed[0].pattern == "myapp/events"
+        assert result.rejected == []
+
+
+# ---------------------------------------------------------------------------
+# C2: Malformed pattern handling
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedPatternHandling:
+    async def test_malformed_hash_pattern_rejected_gracefully(self):
+        """Subscribe to ``myapp/#/messages`` (# not terminal) must produce a
+        RejectedTopic with reason containing ``invalid_pattern``, not crash."""
+        mcp = FastMCP("test")
+        # Use a parameterized declaration whose forward regex will match the
+        # malformed subscription pattern (after wildcard replacement to "x").
+        mcp.declare_event("myapp/{kind}/messages")
+
+        async with Client(mcp) as _client:
+            session = _get_active_session(mcp)
+            result = await _subscribe_via_handler(mcp, session, ["myapp/#/messages"])
+
+        assert result.subscribed == []
+        assert len(result.rejected) == 1
+        assert "invalid_pattern" in result.rejected[0].reason
+
+    async def test_malformed_pattern_doesnt_break_other_topics(self):
+        """A batch subscribe with one valid and one malformed pattern should
+        succeed for the valid one and reject the malformed one."""
+        mcp = FastMCP("test")
+        mcp.declare_event("valid/topic")
+        # Parameterized so forward regex matches bad/#/topic after wildcard sub
+        mcp.declare_event("bad/{kind}/topic")
+
+        async with Client(mcp) as _client:
+            session = _get_active_session(mcp)
+            result = await _subscribe_via_handler(
+                mcp, session, ["valid/topic", "bad/#/topic"]
+            )
+
+        subscribed_patterns = [s.pattern for s in result.subscribed]
+        rejected_patterns = [r.pattern for r in result.rejected]
+        assert "valid/topic" in subscribed_patterns
+        assert "bad/#/topic" in rejected_patterns
+        assert "invalid_pattern" in result.rejected[0].reason
+
+    async def test_valid_hash_terminal_still_works(self):
+        """Subscribe to ``myapp/#`` (terminal #) must succeed."""
+        mcp = FastMCP("test")
+        mcp.declare_event("myapp/status")
+
+        async with Client(mcp) as _client:
+            session = _get_active_session(mcp)
+            result = await _subscribe_via_handler(mcp, session, ["myapp/#"])
+
+        assert len(result.subscribed) == 1
+        assert result.subscribed[0].pattern == "myapp/#"
+        assert result.rejected == []
+
+    async def test_empty_pattern_rejected(self):
+        """Subscribe to an empty string should be rejected gracefully."""
+        mcp = FastMCP("test")
+        mcp.declare_event("myapp/status")
+
+        async with Client(mcp) as _client:
+            session = _get_active_session(mcp)
+            result = await _subscribe_via_handler(mcp, session, [""])
+
+        assert result.subscribed == []
+        assert len(result.rejected) == 1
+
+
 class TestWildcardSmuggling:
     async def test_wildcard_smuggling_rejected(self):
         """A subscribe pattern that touches a session-scoped declaration via
