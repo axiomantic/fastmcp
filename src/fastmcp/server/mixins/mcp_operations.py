@@ -74,44 +74,6 @@ def _extract_topic_params(
     return params
 
 
-def _check_agent_id_enforcement(
-    declared_segments: list[str],
-    subscribe_segments: list[str],
-    session_id: str,
-) -> bool:
-    """Enforce the ``{agent_id}`` magic-placeholder convention.
-
-    For each segment in the declared pattern that is ``{agent_id}``, the
-    corresponding segment in the subscribe pattern MUST be the literal
-    ``session_id`` string (the subscriber's MCP transport session UUID,
-    which fastmcp uses as the agent identity for default enforcement).
-    Wildcards or any other value cause rejection. Handles the ``#``
-    multi-segment wildcard: if ``#`` in the subscribe pattern would consume
-    an ``{agent_id}`` declared segment, reject.
-
-    Declared patterns with no ``{agent_id}`` placeholder always pass.
-    """
-    hash_index: int | None = None
-    for i, seg in enumerate(subscribe_segments):
-        if seg == "#":
-            hash_index = i
-            break
-    for index, declared_seg in enumerate(declared_segments):
-        if declared_seg != "{agent_id}":
-            continue
-        if hash_index is not None and index >= hash_index:
-            # "#" would wildcard over the agent_id slot -- reject.
-            return False
-        if index >= len(subscribe_segments):
-            # Subscribe pattern too short to cover the agent_id slot and
-            # no `#` consumed it; this cannot happen if the patterns
-            # genuinely match, but guard against it anyway.
-            return False
-        if subscribe_segments[index] != session_id:
-            return False
-    return True
-
-
 def _apply_pagination(
     items: Sequence[PaginateT],
     cursor: str | None,
@@ -659,49 +621,38 @@ class MCPOperationsMixin:
         subscribe_pattern: str,
         session_id: str,
     ) -> bool:
-        """Check whether a subscribing session is authorized for a declared pattern.
+        """Run the declared topic's authorize callback if one is registered.
 
-        Applies the authorize-callback override if one is registered for
-        ``declared_pattern``. Otherwise enforces the ``{agent_id}`` magic
-        placeholder convention: for any segment in the declared pattern that
-        is ``{agent_id}``, the corresponding segment in the subscribe
-        pattern must be the literal subscriber transport session UUID.
-        Wildcards (``+``, ``#``) or any other literal in that slot cause
-        rejection.
+        Default policy is permissive: any subscriber that matches the topic
+        pattern is allowed. Per-agent or per-tenant isolation requires an
+        explicit authorize callback registered on the declared topic via
+        ``declare_event(authorize=...)``.
 
-        Non-``{agent_id}`` ``{param}`` placeholders impose no restriction.
-        If the declared pattern contains no ``{agent_id}`` and no authorize
-        callback is registered, all matching subscribers are allowed
-        (legacy behavior).
-
-        Handles the ``#`` (multi-segment wildcard) edge case: ``#`` must
-        appear at the end of the subscribe pattern and consumes all
-        remaining declared-pattern segments. If any consumed segment is
-        ``{agent_id}``, the subscription is rejected.
+        The callback receives ``(session_id, topic_params)`` where
+        ``topic_params`` maps each ``{param}`` placeholder name in the
+        declared pattern to the value supplied by the subscribe pattern
+        (a literal, ``"+"`` for a single-segment wildcard, or ``"#"`` for
+        the multi-segment wildcard). The callback returns True to allow
+        the subscription or False to reject it. If the callback raises,
+        the subscription is denied and a warning is logged.
 
         Returns True to allow the subscription, False to reject it.
         """
+        authorize_cb = self._event_topic_authorize.get(declared_pattern)
+        if authorize_cb is None:
+            return True
         declared_segments = declared_pattern.split("/")
         subscribe_segments = subscribe_pattern.split("/")
-        authorize_cb = self._event_topic_authorize.get(declared_pattern)
-
-        if authorize_cb is not None:
-            topic_params = _extract_topic_params(declared_segments, subscribe_segments)
-            try:
-                return bool(authorize_cb(session_id, topic_params))
-            except Exception:
-                logger.warning(
-                    "authorize callback raised for declared topic %r; "
-                    "denying subscription",
-                    declared_pattern,
-                    exc_info=True,
-                )
-                return False
-
-        # Default policy: {agent_id} enforcement if present in declared.
-        return _check_agent_id_enforcement(
-            declared_segments, subscribe_segments, session_id
-        )
+        topic_params = _extract_topic_params(declared_segments, subscribe_segments)
+        try:
+            return bool(authorize_cb(session_id, topic_params))
+        except Exception:
+            logger.warning(
+                "authorize callback raised for declared topic %r; denying subscription",
+                declared_pattern,
+                exc_info=True,
+            )
+            return False
 
     def _match_declared_topic(self: FastMCP, pattern: str) -> bool:
         """Check whether a subscription pattern matches any declared event topic.
@@ -715,7 +666,7 @@ class MCPOperationsMixin:
 
         Handles both exact matches and wildcard patterns that could match
         declared topic patterns. For example, subscription pattern "myapp/+"
-        matches declared topic "myapp/{agent_id}".
+        matches declared topic "myapp/{param}".
 
         Uses regex-based matching in both directions: the subscription pattern
         is checked against declared patterns (with {param} as single-segment

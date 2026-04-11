@@ -267,7 +267,9 @@ class TestEventEmitNotification:
 class TestFastMCPEventDeclaration:
     def test_declare_event(self):
         mcp = FastMCP("test")
-        desc = mcp.declare_event("myapp/status", kind="content", description="Status", retained=True)
+        desc = mcp.declare_event(
+            "myapp/status", kind="content", description="Status", retained=True
+        )
         assert desc.pattern == "myapp/status"
         assert desc.retained is True
         assert "myapp/status" in mcp._event_topics
@@ -632,7 +634,9 @@ class TestFindTopicDescriptor:
 
     def test_parameterized_match(self):
         mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content", retained=True)
+        mcp.declare_event(
+            "spellbook/sessions/{agent_id}/messages", kind="content", retained=True
+        )
         desc = mcp._find_topic_descriptor("spellbook/sessions/worker-42/messages")
         assert desc is not None
         assert desc.retained is True
@@ -648,7 +652,9 @@ class TestEmitEventParameterizedRetained:
         """Emitting to a concrete topic that matches a parameterized
         retained declaration auto-retains the event."""
         mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content", retained=True)
+        mcp.declare_event(
+            "spellbook/sessions/{agent_id}/messages", kind="content", retained=True
+        )
 
         await mcp.emit_event("spellbook/sessions/worker-42/messages", {"text": "hello"})
 
@@ -660,7 +666,9 @@ class TestEmitEventParameterizedRetained:
         """Emitting to a concrete topic that matches a parameterized
         non-retained declaration does not retain."""
         mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content", retained=False)
+        mcp.declare_event(
+            "spellbook/sessions/{agent_id}/messages", kind="content", retained=False
+        )
 
         await mcp.emit_event("spellbook/sessions/worker-42/messages", {"text": "hello"})
 
@@ -862,7 +870,9 @@ class TestProtocolRoundTrip:
         from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCResponse
 
         mcp_server = FastMCP("test-events")
-        mcp_server.declare_event("myapp/status", kind="content", description="Status updates")
+        mcp_server.declare_event(
+            "myapp/status", kind="content", description="Status updates"
+        )
 
         async with mcp_server._lifespan_manager():
             async with create_client_server_memory_streams() as (
@@ -1023,7 +1033,8 @@ class TestProtocolRoundTrip:
         )
 
         mcp_server = FastMCP("test-events-list")
-        mcp_server.declare_event("myapp/status", kind="content", description="Status updates", retained=True
+        mcp_server.declare_event(
+            "myapp/status", kind="content", description="Status updates", retained=True
         )
         mcp_server.declare_event("myapp/logs", kind="content", description="Log stream")
 
@@ -1594,69 +1605,17 @@ class TestInitializeResultSessionId:
 
 
 # ---------------------------------------------------------------------------
-# {agent_id} default enforcement (no authorize callback)
+# Default authorization policy (no authorize callback): permissive
 # ---------------------------------------------------------------------------
 
 
-class TestAgentIdEnforcement:
-    async def test_can_subscribe_to_own_session_topic(self):
-        mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content")
-
-        async with Client(mcp) as _client:
-            session = _get_active_session(mcp)
-            sid = getattr(session, "_fastmcp_event_session_id")
-            result = await _subscribe_via_handler(
-                mcp, session, [f"spellbook/sessions/{sid}/messages"]
-            )
-
-        assert len(result.subscribed) == 1
-        assert result.subscribed[0].pattern == f"spellbook/sessions/{sid}/messages"
-        assert result.rejected == []
-
-    async def test_cannot_subscribe_to_other_session_topic(self):
-        mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content")
-
-        async with Client(mcp) as _client:
-            session = _get_active_session(mcp)
-            result = await _subscribe_via_handler(
-                mcp,
-                session,
-                ["spellbook/sessions/00000000-0000-0000-0000-000000000000/messages"],
-            )
-
-        assert result.subscribed == []
-        assert len(result.rejected) == 1
-        assert result.rejected[0].reason == "permission_denied"
-
-    async def test_cannot_use_single_wildcard_in_session_slot(self):
-        mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content")
-
-        async with Client(mcp) as _client:
-            session = _get_active_session(mcp)
-            result = await _subscribe_via_handler(
-                mcp, session, ["spellbook/sessions/+/messages"]
-            )
-
-        assert result.subscribed == []
-        assert len(result.rejected) == 1
-        assert result.rejected[0].reason == "permission_denied"
-
-    async def test_cannot_use_hash_wildcard_over_session_slot(self):
-        mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content")
-
-        async with Client(mcp) as _client:
-            session = _get_active_session(mcp)
-            result = await _subscribe_via_handler(
-                mcp, session, ["spellbook/sessions/#"]
-            )
-
-        assert result.subscribed == []
-        assert len(result.rejected) == 1
-        assert result.rejected[0].reason == "permission_denied"
+class TestDefaultAuthorizationPolicy:
+    """Without an explicit ``authorize`` callback any matching subscribe is
+    allowed. ``{agent_id}`` has no special meaning in fastmcp's authorization
+    path per MCP Events v2: multiple agents may share one transport, so the
+    transport session UUID is not a reliable agent identity. Per-agent
+    isolation is opt-in via ``declare_event(authorize=...)``.
+    """
 
     async def test_public_topic_allows_any_subscriber(self):
         mcp = FastMCP("test")
@@ -1671,8 +1630,58 @@ class TestAgentIdEnforcement:
         assert len(result.subscribed) == 1
         assert result.rejected == []
 
-    async def test_non_magic_placeholder_allows_wildcard(self):
-        """``{project}`` is not magic, so wildcards are permitted in that slot."""
+    async def test_agent_id_literal_allowed_by_default(self):
+        """A concrete ``{agent_id}`` slot value is allowed without a callback.
+        The server has no reliable way to bind a subscriber to a specific
+        agent identity on a shared transport, so default policy permits any
+        literal in that slot.
+        """
+        mcp = FastMCP("test")
+        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content")
+
+        async with Client(mcp) as _client:
+            session = _get_active_session(mcp)
+            result = await _subscribe_via_handler(
+                mcp,
+                session,
+                ["spellbook/sessions/00000000-0000-0000-0000-000000000000/messages"],
+            )
+
+        assert len(result.subscribed) == 1
+        assert (
+            result.subscribed[0].pattern
+            == "spellbook/sessions/00000000-0000-0000-0000-000000000000/messages"
+        )
+        assert result.rejected == []
+
+    async def test_single_wildcard_in_agent_id_slot_allowed_by_default(self):
+        mcp = FastMCP("test")
+        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content")
+
+        async with Client(mcp) as _client:
+            session = _get_active_session(mcp)
+            result = await _subscribe_via_handler(
+                mcp, session, ["spellbook/sessions/+/messages"]
+            )
+
+        assert len(result.subscribed) == 1
+        assert result.rejected == []
+
+    async def test_hash_wildcard_over_agent_id_slot_allowed_by_default(self):
+        mcp = FastMCP("test")
+        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content")
+
+        async with Client(mcp) as _client:
+            session = _get_active_session(mcp)
+            result = await _subscribe_via_handler(
+                mcp, session, ["spellbook/sessions/#"]
+            )
+
+        assert len(result.subscribed) == 1
+        assert result.rejected == []
+
+    async def test_non_agent_placeholder_allows_wildcard(self):
+        """A non-``{agent_id}`` placeholder accepts wildcards with no callback."""
         mcp = FastMCP("test")
         mcp.declare_event("spellbook/builds/{project}/status", kind="content")
 
@@ -1768,26 +1777,80 @@ class TestAuthorizeCallback:
             "authorize callback raised" in record.message for record in caplog.records
         ), "Expected a warning log when authorize raises"
 
-    async def test_authorize_callback_overrides_default_session_id_check(self):
-        """An authorize callback fully replaces the {agent_id} default policy."""
+    async def test_authorize_callback_can_reject_wildcard_by_inspecting_params(
+        self,
+    ):
+        """A callback can reject wildcard subscribes on an ``{agent_id}`` slot
+        by inspecting ``topic_params`` and refusing the wildcard literal.
+        This is how per-agent isolation is opted into under v2."""
 
         def authorize(session_id: str, params: dict[str, str]) -> bool:
-            return True
+            return params.get("agent_id") not in ("+", "#")
 
         mcp = FastMCP("test")
-        mcp.declare_event("sessions/{agent_id}/messages", kind="content", authorize=authorize)
+        mcp.declare_event(
+            "sessions/{agent_id}/messages", kind="content", authorize=authorize
+        )
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
-            # Subscribe to a session id that does NOT belong to this session.
-            result = await _subscribe_via_handler(
+            # Concrete literal: permitted.
+            ok = await _subscribe_via_handler(
                 mcp,
                 session,
                 ["sessions/00000000-0000-0000-0000-000000000000/messages"],
             )
+            # Single-segment wildcard: rejected by the callback.
+            plus = await _subscribe_via_handler(mcp, session, ["sessions/+/messages"])
+            # Multi-segment wildcard over the agent_id slot: also rejected.
+            hashed = await _subscribe_via_handler(mcp, session, ["sessions/#"])
 
-        assert len(result.subscribed) == 1
-        assert result.rejected == []
+        assert len(ok.subscribed) == 1
+        assert ok.rejected == []
+
+        assert plus.subscribed == []
+        assert len(plus.rejected) == 1
+        assert plus.rejected[0].reason == "permission_denied"
+
+        assert hashed.subscribed == []
+        assert len(hashed.rejected) == 1
+        assert hashed.rejected[0].reason == "permission_denied"
+
+    async def test_authorize_callback_can_bind_specific_agent_id(self):
+        """A callback can implement per-session/agent binding by comparing
+        ``topic_params["agent_id"]`` against a server-maintained binding
+        between session IDs and permitted agent identities."""
+
+        bindings: dict[str, set[str]] = {}
+
+        def authorize(session_id: str, params: dict[str, str]) -> bool:
+            permitted = bindings.get(session_id, set())
+            return params.get("agent_id") in permitted
+
+        mcp = FastMCP("test")
+        mcp.declare_event(
+            "sessions/{agent_id}/messages", kind="content", authorize=authorize
+        )
+
+        async with Client(mcp) as _client:
+            session = _get_active_session(mcp)
+            sid = getattr(session, "_fastmcp_event_session_id")
+            # Bind this session to a specific agent identity out of band.
+            bindings[sid] = {"agent-alpha"}
+
+            ok = await _subscribe_via_handler(
+                mcp, session, ["sessions/agent-alpha/messages"]
+            )
+            bad = await _subscribe_via_handler(
+                mcp, session, ["sessions/agent-beta/messages"]
+            )
+
+        assert len(ok.subscribed) == 1
+        assert ok.rejected == []
+
+        assert bad.subscribed == []
+        assert len(bad.rejected) == 1
+        assert bad.rejected[0].reason == "permission_denied"
 
 
 # ---------------------------------------------------------------------------
@@ -1992,22 +2055,24 @@ class TestTargetSessionIds:
 class TestOverlappingDeclarations:
     async def test_overlapping_declarations_all_must_authorize(self):
         """When a subscribe pattern matches multiple declarations, ALL must
-        authorize. Here ``myapp/events`` matches both the permissive literal
-        and the session-scoped parameterized declaration. The latter fails
-        authorization, so the subscription must be rejected."""
+        authorize. Here ``myapp/events`` matches both declarations; the
+        second is guarded by a callback that rejects everything, so the
+        subscription must be rejected (a client cannot smuggle a forbidden
+        pattern through by also matching a permissive one)."""
+
+        def deny_all(session_id: str, params: dict[str, str]) -> bool:
+            return False
+
         mcp = FastMCP("test")
         # Permissive: no auth required
         mcp.declare_event("myapp/events", kind="content")
-        # Restrictive: session-scoped
-        mcp.declare_event("myapp/{agent_id}", kind="content")
+        # Restrictive: explicit deny-all callback
+        mcp.declare_event("myapp/{slot}", kind="content", authorize=deny_all)
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
             result = await _subscribe_via_handler(mcp, session, ["myapp/events"])
 
-        # The {agent_id} declaration also matches "myapp/events" (single
-        # segment in the param slot). Its default policy rejects because
-        # "events" != the subscriber's session_id.
         assert result.subscribed == []
         assert len(result.rejected) == 1
         assert result.rejected[0].reason == "permission_denied"
@@ -2027,11 +2092,11 @@ class TestOverlappingDeclarations:
         assert result.rejected == []
 
     async def test_overlapping_permissive_declarations_both_pass(self):
-        """Two overlapping permissive declarations both authorize, so the
-        subscription succeeds."""
+        """Two overlapping declarations both lack an authorize callback, so
+        the subscription succeeds under the default permissive policy."""
         mcp = FastMCP("test")
         mcp.declare_event("myapp/events", kind="content")
-        mcp.declare_event("myapp/{project}", kind="content")  # non-magic param, permissive
+        mcp.declare_event("myapp/{project}", kind="content")  # permissive
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -2112,19 +2177,30 @@ class TestMalformedPatternHandling:
 
 class TestWildcardSmuggling:
     async def test_wildcard_smuggling_rejected(self):
-        """A subscribe pattern that touches a session-scoped declaration via
-        wildcard must be rejected even if it ALSO matches an open declaration.
+        """A subscribe pattern that touches a privately guarded declaration
+        via wildcard must be rejected even if it ALSO matches an open
+        declaration.
 
         Two declarations:
-            - ``sessions/{agent_id}/messages`` (private, session-scoped)
-            - ``sessions/{room}/public`` (open; ``{room}`` is non-magic)
+            - ``sessions/{agent_id}/messages`` (private, guarded by an
+              explicit authorize callback that rejects wildcards)
+            - ``sessions/{room}/public`` (open, no callback)
 
         The subscribe pattern ``sessions/+/messages`` is a wildcard superset
-        of the private pattern. It must be rejected because the wildcard would
-        cover other sessions' private messages.
+        of the private pattern. It must be rejected because its callback
+        denies wildcard access, even though the public declaration is also
+        nominally matched by the wildcard subscribe.
         """
+
+        def reject_wildcards(session_id: str, params: dict[str, str]) -> bool:
+            return params.get("agent_id") not in ("+", "#")
+
         mcp = FastMCP("test")
-        mcp.declare_event("sessions/{agent_id}/messages", kind="content")
+        mcp.declare_event(
+            "sessions/{agent_id}/messages",
+            kind="content",
+            authorize=reject_wildcards,
+        )
         mcp.declare_event("sessions/{room}/public", kind="content")
 
         async with Client(mcp) as _client:

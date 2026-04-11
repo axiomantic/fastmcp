@@ -1688,33 +1688,29 @@ class FastMCP(
                        pattern that matches this declaration. Receives
                        ``(session_id, topic_params)`` and returns True to
                        permit the subscription or False to reject it with
-                       ``reason="permission_denied"``. When provided, this
-                       callback OVERRIDES the default ``{agent_id}``
-                       enforcement described below and is fully responsible
-                       for authorization. ``topic_params`` is a dict mapping
-                       each placeholder name in the declared pattern to the
-                       value supplied by the subscribing pattern: either a
-                       literal string, the wildcard character ``"+"`` (single
-                       segment wildcard), or ``"#"`` (multi-segment wildcard).
+                       ``reason="permission_denied"``. ``topic_params`` is a
+                       dict mapping each placeholder name in the declared
+                       pattern to the value supplied by the subscribing
+                       pattern: either a literal string, the wildcard
+                       character ``"+"`` (single segment wildcard), or
+                       ``"#"`` (multi-segment wildcard).
 
-        ``{agent_id}`` convention:
-            The literal placeholder ``{agent_id}`` in a declared pattern is
-            magic. When no ``authorize`` callback is set, any subscribe
-            pattern whose corresponding segment is NOT the literal subscriber
-            transport session UUID is rejected with
-            ``reason="permission_denied"``. Wildcards (``+``, ``#``) in that
-            slot are not permitted. Other ``{param}`` placeholder names have
-            no special meaning and impose no per-subscriber restriction. If
-            neither ``{agent_id}`` nor ``authorize`` is present, all
-            subscribers that match the pattern are allowed (legacy
-            behavior).
+        Authorization model:
+            By default any subscriber whose subscribe pattern matches a
+            declared topic is allowed. Per-agent or per-tenant isolation
+            is opt-in via an explicit ``authorize`` callback. The callback
+            is fully responsible for deciding whether the subscription is
+            permitted; fastmcp applies no additional policy.
 
-            Note: ``{agent_id}`` is the application-level identity
-            placeholder per MCP Events Spec v2. Clients resolve it to their
-            own agent identity before subscribing; servers see fully
-            resolved topic strings. For fastmcp's default enforcement the
-            "agent id" is the MCP transport session UUID that fastmcp
-            assigns to each connection.
+            Per MCP Events Spec v2, ``{agent_id}`` is an application-level
+            identity placeholder declared by the server and resolved by
+            the client before subscribing. It has no special meaning in
+            fastmcp's authorization path: the transport session UUID is
+            not the agent identity, and multiple agents may share one
+            transport. Servers that want to gate subscriptions by agent
+            identity should register an ``authorize`` callback and
+            consult ``topic_params["agent_id"]`` together with any
+            out-of-band binding between sessions and agent identities.
 
         Returns:
             The registered EventTopicDescriptor.
@@ -1821,8 +1817,7 @@ class FastMCP(
                               behavior. See ``declare_event`` for details.
             retained: Whether to store the most recent value per topic.
             authorize: Optional subscription authorization callback. See
-                       ``declare_event`` for full semantics, including the
-                       ``{agent_id}`` magic-placeholder convention.
+                       ``declare_event`` for full semantics.
         """
 
         def decorator(fn: F) -> F:
