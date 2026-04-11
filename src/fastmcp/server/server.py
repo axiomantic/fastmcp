@@ -34,7 +34,6 @@ from mcp.types import (
     Annotations,
     AnyFunction,
     CallToolRequestParams,
-    EventEffect,
     EventTopicDescriptor,
     RetainedEvent,
     ToolAnnotations,
@@ -1656,7 +1655,12 @@ class FastMCP(
         self,
         pattern: str,
         *,
+        kind: Literal["content", "signal"],
         description: str | None = None,
+        suggested_handle: Literal[
+            "drop", "silent", "notify", "ask", "inject", "interrupt"
+        ]
+        | None = None,
         retained: bool = False,
         schema: dict[str, Any] | None = None,
         authorize: Callable[[str, dict[str, str]], bool] | None = None,
@@ -1664,10 +1668,19 @@ class FastMCP(
         """Declare an event topic that this server can publish to.
 
         Args:
-            pattern: Topic pattern (e.g., "myapp/sessions/{session_id}/messages").
+            pattern: Topic pattern (e.g., "agents/{agent_id}/messages").
                      ``{param}`` placeholders describe parameterized segments.
                      Maximum depth: 8 segments.
+            kind: REQUIRED. Either ``"content"`` (payloads are suitable for
+                  LLM context injection) or ``"signal"`` (machine-only events
+                  intended for programmatic consumption, not LLM injection).
             description: Human-readable description of the topic.
+            suggested_handle: Optional advisory hint for how clients SHOULD
+                              handle events on this topic. One of
+                              ``drop``, ``silent``, ``notify``, ``ask``,
+                              ``inject``, ``interrupt``. Clients remain free
+                              to override based on their own configuration
+                              (zero-trust model).
             retained: Whether the most recent event per topic is stored and
                       delivered to new subscribers on subscribe.
             schema: Optional JSON Schema for the event payload.
@@ -1676,7 +1689,7 @@ class FastMCP(
                        ``(session_id, topic_params)`` and returns True to
                        permit the subscription or False to reject it with
                        ``reason="permission_denied"``. When provided, this
-                       callback OVERRIDES the default ``{session_id}``
+                       callback OVERRIDES the default ``{agent_id}``
                        enforcement described below and is fully responsible
                        for authorization. ``topic_params`` is a dict mapping
                        each placeholder name in the declared pattern to the
@@ -1684,16 +1697,24 @@ class FastMCP(
                        literal string, the wildcard character ``"+"`` (single
                        segment wildcard), or ``"#"`` (multi-segment wildcard).
 
-        ``{session_id}`` convention:
-            The literal placeholder ``{session_id}`` in a declared pattern is
+        ``{agent_id}`` convention:
+            The literal placeholder ``{agent_id}`` in a declared pattern is
             magic. When no ``authorize`` callback is set, any subscribe
             pattern whose corresponding segment is NOT the literal subscriber
-            session UUID is rejected with ``reason="permission_denied"``.
-            Wildcards (``+``, ``#``) in that slot are not permitted. Other
-            ``{param}`` placeholder names have no special meaning and impose
-            no per-subscriber restriction. If neither ``{session_id}`` nor
-            ``authorize`` is present, all subscribers that match the pattern
-            are allowed (legacy behavior).
+            transport session UUID is rejected with
+            ``reason="permission_denied"``. Wildcards (``+``, ``#``) in that
+            slot are not permitted. Other ``{param}`` placeholder names have
+            no special meaning and impose no per-subscriber restriction. If
+            neither ``{agent_id}`` nor ``authorize`` is present, all
+            subscribers that match the pattern are allowed (legacy
+            behavior).
+
+            Note: ``{agent_id}`` is the application-level identity
+            placeholder per MCP Events Spec v2. Clients resolve it to their
+            own agent identity before subscribing; servers see fully
+            resolved topic strings. For fastmcp's default enforcement the
+            "agent id" is the MCP transport session UUID that fastmcp
+            assigns to each connection.
 
         Returns:
             The registered EventTopicDescriptor.
@@ -1709,7 +1730,9 @@ class FastMCP(
             )
         descriptor = EventTopicDescriptor(
             pattern=pattern,
+            kind=kind,
             description=description,
+            suggestedHandle=suggested_handle,
             retained=retained,
             schema=schema,
         )
@@ -1766,7 +1789,12 @@ class FastMCP(
         self,
         pattern: str,
         *,
+        kind: Literal["content", "signal"],
         description: str | None = None,
+        suggested_handle: Literal[
+            "drop", "silent", "notify", "ask", "inject", "interrupt"
+        ]
+        | None = None,
         retained: bool = False,
         authorize: Callable[[str, dict[str, str]], bool] | None = None,
     ) -> Callable[[F], F]:
@@ -1779,18 +1807,22 @@ class FastMCP(
 
         Example::
 
-            @mcp.event("myapp/status")
+            @mcp.event("myapp/status", kind="content")
             def status_event() -> dict:
                 '''Server status updates.'''
                 ...
 
         Args:
             pattern: Topic pattern for the event.
+            kind: REQUIRED. ``"content"`` or ``"signal"``. See
+                  ``declare_event`` for full semantics.
             description: Optional description (falls back to docstring).
+            suggested_handle: Optional advisory hint for client handle
+                              behavior. See ``declare_event`` for details.
             retained: Whether to store the most recent value per topic.
             authorize: Optional subscription authorization callback. See
                        ``declare_event`` for full semantics, including the
-                       ``{session_id}`` magic-placeholder convention.
+                       ``{agent_id}`` magic-placeholder convention.
         """
 
         def decorator(fn: F) -> F:
@@ -1817,7 +1849,9 @@ class FastMCP(
 
             self.declare_event(
                 pattern,
+                kind=kind,
                 description=desc,
+                suggested_handle=suggested_handle,
                 retained=retained,
                 schema=payload_schema,
                 authorize=authorize,
@@ -1829,14 +1863,13 @@ class FastMCP(
     async def emit_event(
         self,
         topic: str,
-        payload: Any,
+        payload: Any = None,
         *,
+        priority: Literal["urgent", "high", "normal", "low"] = "normal",
+        source: str | None = None,
+        expires_at: str | None = None,
         event_id: str | None = None,
         retained: bool | None = None,
-        source: str | None = None,
-        correlation_id: str | None = None,
-        requested_effects: list[EventEffect] | None = None,
-        expires_at: str | None = None,
         target_session_ids: Collection[str] | None = None,
     ) -> None:
         """Broadcast an event to all sessions subscribed to the given topic.
@@ -1849,14 +1882,24 @@ class FastMCP(
 
         Args:
             topic: Concrete topic string (no wildcards).
-            payload: Event payload (any JSON-serializable value).
-            event_id: Optional event ID (auto-generated ULID if not provided).
-            retained: If True, store as retained value for the topic. Defaults
-                      to the topic descriptor's ``retained`` setting if declared.
-            source: Optional source identifier.
-            correlation_id: Optional correlation ID for request tracing.
-            requested_effects: Optional list of advisory effect hints.
-            expires_at: Optional ISO 8601 expiry timestamp for retained values.
+            payload: Event payload (any JSON-serializable value). Optional;
+                     may be ``None`` for pure signal events whose topic alone
+                     carries the information.
+            priority: Delivery priority hint per MCP Events Spec v2. One of
+                      ``"urgent"``, ``"high"``, ``"normal"`` (default),
+                      ``"low"``. Only ``"urgent"`` may cancel in-progress
+                      LLM generation; the others influence when the client
+                      processes the event.
+            source: Optional source identifier (e.g., ``"tool/build"``,
+                    ``"spellbook/messaging"``).
+            expires_at: Optional ISO 8601 expiry timestamp. Servers SHOULD
+                        NOT emit events that are already expired; clients
+                        MUST drop events whose ``expires_at`` has passed.
+            event_id: Optional event ID (auto-generated ULID if not
+                      provided).
+            retained: If True, store as retained value for the topic.
+                      Defaults to the topic descriptor's ``retained``
+                      setting if declared.
             target_session_ids: Optional defense-in-depth filter. When None
                       (default), the event is delivered to every session whose
                       subscriptions match the topic. When a collection is
@@ -1882,7 +1925,6 @@ class FastMCP(
             retained_event = RetainedEvent(
                 topic=topic,
                 eventId=event_id,
-                timestamp=None,
                 payload=payload,
             )
             await self._retained_store.set(topic, retained_event, expires_at=expires_at)
@@ -1910,10 +1952,9 @@ class FastMCP(
                 topic=topic,
                 eventId=event_id,
                 payload=payload,
+                priority=priority,
                 retained=retained,
                 source=source,
-                correlationId=correlation_id,
-                requestedEffects=requested_effects,
                 expiresAt=expires_at,
             ),
         )

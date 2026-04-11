@@ -27,21 +27,23 @@ from fastmcp import FastMCP
 
 mcp = FastMCP("EventServer")
 
-@mcp.event("myapp/status")
+@mcp.event("myapp/status", kind="content")
 def status_event() -> dict:
     """Server status updates."""
     ...
 
-@mcp.event("myapp/metrics")
+@mcp.event("myapp/metrics", kind="signal")
 def metrics_event() -> dict:
     """Periodic metric snapshots."""
     ...
 ```
 
+Every declaration MUST specify a `kind`: `"content"` means payloads are suitable for LLM context injection, `"signal"` means machine-only events (programmatic consumption, not LLM injection).
+
 The decorator reads the docstring as the topic description and extracts a JSON Schema from the return type annotation. If you provide an explicit `description`, it takes precedence over the docstring.
 
 ```python
-@mcp.event("myapp/alerts", description="Critical system alerts")
+@mcp.event("myapp/alerts", kind="content", description="Critical system alerts")
 def alert_event() -> dict:
     ...
 ```
@@ -55,7 +57,9 @@ mcp = FastMCP("EventServer")
 
 mcp.declare_event(
     "myapp/status",
+    kind="content",
     description="Server status updates",
+    suggested_handle="notify",
     retained=True,
     schema={"type": "object", "properties": {"state": {"type": "string"}}},
 )
@@ -66,8 +70,16 @@ mcp.declare_event(
   Topic pattern string. Supports `{param}` placeholders for parameterized topics (see [Topic Patterns](#topic-patterns)). Maximum depth: 8 segments.
 </ParamField>
 
+<ParamField body="kind" type='"content" | "signal"' required>
+  REQUIRED. `"content"` for events whose payloads are safe to inject into LLM context. `"signal"` for machine-only events that clients process programmatically without LLM visibility.
+</ParamField>
+
 <ParamField body="description" type="str | None">
   Human-readable description of the topic.
+</ParamField>
+
+<ParamField body="suggested_handle" type='"drop" | "silent" | "notify" | "ask" | "inject" | "interrupt" | None'>
+  Advisory hint for how clients SHOULD handle events on this topic. Clients remain free to override based on their own configuration (zero-trust model).
 </ParamField>
 
 <ParamField body="retained" type="bool" default="False">
@@ -92,7 +104,7 @@ from fastmcp import FastMCP, Context
 
 mcp = FastMCP("EventServer")
 
-mcp.declare_event("myapp/notifications", description="User notifications")
+mcp.declare_event("myapp/notifications", kind="content", description="User notifications")
 
 @mcp.tool
 async def send_notification(message: str, ctx: Context) -> str:
@@ -113,7 +125,7 @@ from fastmcp import FastMCP
 
 mcp = FastMCP("SensorServer")
 
-mcp.declare_event("sensors/temperature", description="Temperature readings", retained=True)
+mcp.declare_event("sensors/temperature", kind="signal", description="Temperature readings", retained=True)
 
 @mcp.lifespan
 async def publish_temperature(server: FastMCP):
@@ -138,8 +150,20 @@ async def publish_temperature(server: FastMCP):
   Concrete topic string (no wildcards). Must match a declared topic pattern.
 </ParamField>
 
-<ParamField body="payload" type="Any" required>
-  Event payload. Any JSON-serializable value.
+<ParamField body="payload" type="Any">
+  Event payload. Any JSON-serializable value. Optional; may be `None` for pure signal events whose topic alone carries the information.
+</ParamField>
+
+<ParamField body="priority" type='"urgent" | "high" | "normal" | "low"' default='"normal"'>
+  Delivery priority hint per MCP Events Spec v2. Only `"urgent"` may cancel in-progress LLM generation; the others influence when the client processes the event.
+</ParamField>
+
+<ParamField body="source" type="str | None">
+  Source identifier for tracing where the event originated. Auto-set to `tool/<name>` when called from a tool context.
+</ParamField>
+
+<ParamField body="expires_at" type="str | None">
+  ISO 8601 timestamp after which the event should be discarded. Servers SHOULD NOT emit already-expired events; clients MUST drop events whose `expires_at` has passed.
 </ParamField>
 
 <ParamField body="event_id" type="str | None">
@@ -148,22 +172,6 @@ async def publish_temperature(server: FastMCP):
 
 <ParamField body="retained" type="bool | None">
   Override the topic's retained setting for this specific event. If `None`, uses the topic descriptor's `retained` value.
-</ParamField>
-
-<ParamField body="source" type="str | None">
-  Source identifier for tracing where the event originated.
-</ParamField>
-
-<ParamField body="correlation_id" type="str | None">
-  Correlation ID for request tracing across systems.
-</ParamField>
-
-<ParamField body="requested_effects" type="list[EventEffect] | None">
-  Advisory hints for clients about how to handle the event (e.g., inject into context, show notification).
-</ParamField>
-
-<ParamField body="expires_at" type="str | None">
-  ISO 8601 timestamp after which the retained value should be considered stale. Only meaningful when the event is retained.
 </ParamField>
 </Card>
 
@@ -177,10 +185,10 @@ This is useful for state that has a "current value" semantic: connection status,
 mcp = FastMCP("StatusServer")
 
 # The retained flag causes the last emitted event to be stored
-mcp.declare_event("service/status", description="Service health status", retained=True)
+mcp.declare_event("service/status", kind="content", description="Service health status", retained=True)
 
 # Or with the decorator:
-@mcp.event("service/config", retained=True)
+@mcp.event("service/config", kind="content", retained=True)
 def config_event() -> dict:
     """Current service configuration."""
     ...
@@ -209,6 +217,7 @@ mcp = FastMCP("ChatServer")
 # A parameterized topic pattern
 mcp.declare_event(
     "chat/rooms/{room_id}/messages",
+    kind="content",
     description="Messages in a chat room",
 )
 
@@ -234,35 +243,38 @@ Each session receives at most one copy of an event, even if multiple subscriptio
 
 ## Authorization
 
-### The `{session_id}` Placeholder
+### The `{agent_id}` Placeholder
 
-The placeholder name `{session_id}` is special. When a topic is declared with `{session_id}`, FastMCP automatically enforces that each subscriber can only subscribe to their own session's slot:
+The placeholder name `{agent_id}` is special. Per MCP Events Spec v2, `{agent_id}` is the application-level identity placeholder: clients resolve it to their own agent identity before subscribing, and servers see fully resolved topic strings. For fastmcp's default enforcement, the "agent id" is the MCP transport session UUID that fastmcp assigns to each connection.
 
-- A subscriber **must** substitute their own session UUID in the `{session_id}` position.
-- Wildcards (`+`, `#`) in the `{session_id}` position are rejected.
+When a topic is declared with `{agent_id}`, FastMCP automatically enforces that each subscriber can only subscribe to their own slot:
+
+- A subscriber **must** substitute their own session UUID in the `{agent_id}` position.
+- Wildcards (`+`, `#`) in the `{agent_id}` position are rejected.
 - Another session's UUID in that position is rejected.
 - Rejected subscriptions receive reason `"permission_denied"`.
 
 Other `{param}` names have no special enforcement and allow wildcards freely.
 
 ```python
-# Session-scoped: only the owning session can subscribe
-mcp.declare_event("app/sessions/{session_id}/messages")
+# Agent-scoped: only the owning agent can subscribe
+mcp.declare_event("app/agents/{agent_id}/messages", kind="content")
 
 # Public: any session can subscribe
-mcp.declare_event("app/server/status")
+mcp.declare_event("app/server/status", kind="signal")
 
 # Public with descriptive placeholder: {project} is not magic
-mcp.declare_event("app/builds/{project}/status")
+mcp.declare_event("app/builds/{project}/status", kind="signal")
 ```
 
 ### The `authorize` Callback
 
-For custom authorization beyond `{session_id}`, use the `authorize` parameter on `declare_event`:
+For custom authorization beyond `{agent_id}`, use the `authorize` parameter on `declare_event`:
 
 ```python
 mcp.declare_event(
     "app/rooms/{room}/chat",
+    kind="content",
     authorize=lambda session_id, topic_params: session_id in get_room_members(topic_params["room"]),
 )
 ```
@@ -272,14 +284,14 @@ The callback signature is `(session_id: str, topic_params: dict[str, str])`:
 - `session_id` is the subscribing session's UUID.
 - `topic_params` maps placeholder names to the concrete values from the subscribe pattern. Wildcards are passed as literal `"+"` or `"#"`.
 - Return `True` to allow, `False` to reject.
-- If `authorize` is set, it **overrides** the default `{session_id}` check entirely. The callback is fully responsible for authorization.
+- If `authorize` is set, it **overrides** the default `{agent_id}` check entirely. The callback is fully responsible for authorization.
 - If the callback raises, the subscription is denied (fail-closed) and a warning is logged.
 
 ### Client `session_id` Discovery
 
 Clients can discover their server-assigned `session_id` from the initialize response. The server includes `session_id` in `InitializeResult._meta`. Python SDK clients access it via `session.session_id`.
 
-This is the UUID that the `{session_id}` convention enforces against.
+This is the UUID that the `{agent_id}` convention enforces against.
 
 ### Targeted Emission
 
@@ -295,7 +307,7 @@ await mcp.emit_event(
 
 - If `None` (default): broadcast to all matching subscribers.
 - If set: only deliver to sessions in this list that also have a matching subscription.
-- Useful for defense-in-depth routing alongside `{session_id}` scoping.
+- Useful for defense-in-depth routing alongside `{agent_id}` scoping.
 
 ## Session Registry and Broadcast
 

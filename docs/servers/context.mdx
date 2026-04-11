@@ -225,7 +225,7 @@ async def notify_users(message: str, ctx: Context) -> str:
 ```
 
 **Method signature:**
-- **`await ctx.emit_event(topic, payload, *, event_id=None, retained=None, source=None, correlation_id=None, requested_effects=None, expires_at=None)`**: Publish an event to matching subscribers. See [Events](/servers/events) for full parameter documentation.
+- **`await ctx.emit_event(topic, payload=None, *, priority="normal", source=None, expires_at=None, event_id=None, retained=None)`**: Publish an event to matching subscribers. See [Events](/servers/events) for full parameter documentation.
 
 ### Session State
 

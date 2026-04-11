@@ -20,7 +20,6 @@ from mcp.types import EventSubscribeRequest, ServerNotification
 from fastmcp import Client, FastMCP
 from fastmcp.server.context import Context
 from fastmcp.server.events import (
-    EventEffect,
     EventEmitNotification,
     EventParams,
     EventSubscribeParams,
@@ -193,19 +192,32 @@ class TestRetainedValueStore:
 
 class TestEventTopicDescriptor:
     def test_basic_creation(self):
-        desc = EventTopicDescriptor(pattern="myapp/status", description="Status")
+        desc = EventTopicDescriptor(
+            pattern="myapp/status", kind="content", description="Status"
+        )
         assert desc.pattern == "myapp/status"
+        assert desc.kind == "content"
         assert desc.description == "Status"
         assert desc.retained is False
 
     def test_schema_alias(self):
         desc = EventTopicDescriptor(
             pattern="myapp/status",
+            kind="content",
             schema={"type": "object"},
         )
         dumped = desc.model_dump(by_alias=True)
         assert "schema" in dumped
         assert dumped["schema"] == {"type": "object"}
+
+    def test_suggested_handle_camel_case_alias(self):
+        desc = EventTopicDescriptor(
+            pattern="myapp/alerts",
+            kind="content",
+            suggestedHandle="inject",
+        )
+        dumped = desc.model_dump(by_alias=True, exclude_none=True)
+        assert dumped["suggestedHandle"] == "inject"
 
 
 # ---------------------------------------------------------------------------
@@ -232,19 +244,19 @@ class TestEventEmitNotification:
                 eventId="e1",
                 payload={"status": "running"},
                 retained=True,
-                requestedEffects=[EventEffect(type="inject_context", priority="high")],
+                priority="high",
             )
         )
-        data = notification.model_dump(exclude_none=True)
+        data = notification.model_dump(by_alias=True, exclude_none=True)
         assert data["method"] == "events/emit"
         assert data["params"]["topic"] == "myapp/status"
         assert data["params"]["eventId"] == "e1"
         assert data["params"]["payload"] == {"status": "running"}
         assert data["params"]["retained"] is True
-        assert len(data["params"]["requestedEffects"]) == 1
-        effect = data["params"]["requestedEffects"][0]
-        assert effect["type"] == "inject_context"
-        assert effect["priority"] == "high"
+        assert data["params"]["priority"] == "high"
+        # v2 removed fields must not appear
+        assert "requestedEffects" not in data["params"]
+        assert "correlationId" not in data["params"]
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +267,7 @@ class TestEventEmitNotification:
 class TestFastMCPEventDeclaration:
     def test_declare_event(self):
         mcp = FastMCP("test")
-        desc = mcp.declare_event("myapp/status", description="Status", retained=True)
+        desc = mcp.declare_event("myapp/status", kind="content", description="Status", retained=True)
         assert desc.pattern == "myapp/status"
         assert desc.retained is True
         assert "myapp/status" in mcp._event_topics
@@ -263,7 +275,7 @@ class TestFastMCPEventDeclaration:
     def test_event_decorator(self):
         mcp = FastMCP("test")
 
-        @mcp.event("myapp/messages")
+        @mcp.event("myapp/messages", kind="content")
         def message_event() -> dict:
             """Message notifications."""
             return {}
@@ -275,7 +287,7 @@ class TestFastMCPEventDeclaration:
     def test_event_decorator_schema_from_return_type(self):
         mcp = FastMCP("test")
 
-        @mcp.event("myapp/typed")
+        @mcp.event("myapp/typed", kind="content")
         def typed_event() -> int:
             return 0
 
@@ -285,8 +297,8 @@ class TestFastMCPEventDeclaration:
 
     def test_multiple_topics(self):
         mcp = FastMCP("test")
-        mcp.declare_event("a/b")
-        mcp.declare_event("c/d")
+        mcp.declare_event("a/b", kind="content")
+        mcp.declare_event("c/d", kind="content")
         assert len(mcp._event_topics) == 2
 
 
@@ -299,7 +311,7 @@ class TestEventCapability:
     async def test_capability_advertised(self):
         """When event topics are declared, the events capability is advertised."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status", description="Status updates")
+        mcp.declare_event("myapp/status", kind="content", description="Status updates")
 
         async with Client(mcp) as client:
             # The client's initialize_result should have the events capability
@@ -337,7 +349,7 @@ class TestFastMCPEmitEvent:
         import re
 
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status", retained=True)
+        mcp.declare_event("myapp/status", kind="content", retained=True)
 
         await mcp.emit_event("myapp/status", {"state": "running"})
 
@@ -379,7 +391,7 @@ class TestFastMCPEmitEvent:
     async def test_emit_event_retained(self):
         """emit_event stores retained value when topic is declared retained."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status", retained=True)
+        mcp.declare_event("myapp/status", kind="content", retained=True)
 
         await mcp.emit_event("myapp/status", {"state": "running"})
 
@@ -390,7 +402,7 @@ class TestFastMCPEmitEvent:
     async def test_emit_event_not_retained(self):
         """emit_event does not store when topic is not retained."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status", retained=False)
+        mcp.declare_event("myapp/status", kind="content", retained=False)
 
         await mcp.emit_event("myapp/status", {"state": "running"})
 
@@ -400,7 +412,7 @@ class TestFastMCPEmitEvent:
     async def test_emit_event_explicit_retained_override(self):
         """retained=True on emit overrides topic descriptor."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status", retained=False)
+        mcp.declare_event("myapp/status", kind="content", retained=False)
 
         await mcp.emit_event("myapp/status", {"state": "running"}, retained=True)
 
@@ -413,7 +425,7 @@ class TestFastMCPEmitEvent:
     async def test_emit_event_with_expires_at(self):
         """emit_event stores retained value with expires_at, and expired ones are cleaned."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status", retained=True)
+        mcp.declare_event("myapp/status", kind="content", retained=True)
 
         # Emit with a far-future expiry - should be retrievable
         await mcp.emit_event(
@@ -438,8 +450,8 @@ class TestFastMCPEmitEvent:
 
         # Verify expired events are cleaned from get_matching too
         mcp2 = FastMCP("test2")
-        mcp2.declare_event("myapp/a", retained=True)
-        mcp2.declare_event("myapp/b", retained=True)
+        mcp2.declare_event("myapp/a", kind="content", retained=True)
+        mcp2.declare_event("myapp/b", kind="content", retained=True)
 
         await mcp2.emit_event(
             "myapp/a",
@@ -466,36 +478,31 @@ class TestContextEmitEvent:
     async def test_emit_event_from_tool(self):
         """Tools can emit events via ctx.emit_event()."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/notifications")
+        mcp.declare_event("myapp/notifications", kind="content")
 
         emitted_calls: list[dict[str, Any]] = []
         original_emit = mcp.emit_event
 
         async def tracking_emit(
             topic: str,
-            payload: Any,
+            payload: Any = None,
             *,
+            priority: str = "normal",
+            source: str | None = None,
+            expires_at: str | None = None,
             event_id: str | None = None,
             retained: bool | None = None,
-            source: str | None = None,
-            correlation_id: str | None = None,
-            requested_effects: list[EventEffect] | None = None,
-            expires_at: str | None = None,
             target_session_ids: Any = None,
         ) -> None:
-            kwargs: dict[str, Any] = {}
+            kwargs: dict[str, Any] = {"priority": priority}
+            if source is not None:
+                kwargs["source"] = source
+            if expires_at is not None:
+                kwargs["expires_at"] = expires_at
             if event_id is not None:
                 kwargs["event_id"] = event_id
             if retained is not None:
                 kwargs["retained"] = retained
-            if source is not None:
-                kwargs["source"] = source
-            if correlation_id is not None:
-                kwargs["correlation_id"] = correlation_id
-            if requested_effects is not None:
-                kwargs["requested_effects"] = requested_effects
-            if expires_at is not None:
-                kwargs["expires_at"] = expires_at
             if target_session_ids is not None:
                 kwargs["target_session_ids"] = target_session_ids
             emitted_calls.append({"topic": topic, "payload": payload, **kwargs})
@@ -527,22 +534,22 @@ class TestContextEmitEvent:
 class TestTopicMatching:
     def test_exact_match(self):
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status")
+        mcp.declare_event("myapp/status", kind="content")
         assert mcp._match_declared_topic("myapp/status") is True
 
     def test_wildcard_plus_matches_param(self):
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/{session_id}/messages")
+        mcp.declare_event("myapp/{agent_id}/messages", kind="content")
         assert mcp._match_declared_topic("myapp/+/messages") is True
 
     def test_wildcard_hash_matches_param(self):
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/{session_id}/messages")
+        mcp.declare_event("myapp/{agent_id}/messages", kind="content")
         assert mcp._match_declared_topic("myapp/#") is True
 
     def test_no_match(self):
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status")
+        mcp.declare_event("myapp/status", kind="content")
         assert mcp._match_declared_topic("other/status") is False
 
 
@@ -559,7 +566,7 @@ class TestTopicMatchesPattern:
         assert (
             FastMCP._topic_matches_pattern(
                 "myapp/worker-42/messages",
-                "myapp/{session_id}/messages",
+                "myapp/{agent_id}/messages",
             )
             is True
         )
@@ -574,7 +581,7 @@ class TestTopicMatchesPattern:
         assert (
             FastMCP._topic_matches_pattern(
                 "other/worker-42/messages",
-                "myapp/{session_id}/messages",
+                "myapp/{agent_id}/messages",
             )
             is False
         )
@@ -618,21 +625,21 @@ class TestTopicMatchesPattern:
 class TestFindTopicDescriptor:
     def test_direct_match(self):
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status", retained=True)
+        mcp.declare_event("myapp/status", kind="content", retained=True)
         desc = mcp._find_topic_descriptor("myapp/status")
         assert desc is not None
         assert desc.retained is True
 
     def test_parameterized_match(self):
         mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{session_id}/messages", retained=True)
+        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content", retained=True)
         desc = mcp._find_topic_descriptor("spellbook/sessions/worker-42/messages")
         assert desc is not None
         assert desc.retained is True
 
     def test_no_match_returns_none(self):
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status")
+        mcp.declare_event("myapp/status", kind="content")
         assert mcp._find_topic_descriptor("other/topic") is None
 
 
@@ -641,7 +648,7 @@ class TestEmitEventParameterizedRetained:
         """Emitting to a concrete topic that matches a parameterized
         retained declaration auto-retains the event."""
         mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{session_id}/messages", retained=True)
+        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content", retained=True)
 
         await mcp.emit_event("spellbook/sessions/worker-42/messages", {"text": "hello"})
 
@@ -653,7 +660,7 @@ class TestEmitEventParameterizedRetained:
         """Emitting to a concrete topic that matches a parameterized
         non-retained declaration does not retain."""
         mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{session_id}/messages", retained=False)
+        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content", retained=False)
 
         await mcp.emit_event("spellbook/sessions/worker-42/messages", {"text": "hello"})
 
@@ -691,7 +698,7 @@ class TestSessionRegistry:
     async def test_session_cleanup_on_disconnect(self):
         """Session subscriptions are cleaned up on disconnect."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status")
+        mcp.declare_event("myapp/status", kind="content")
 
         async with Client(mcp) as _client:
             assert len(mcp._active_sessions) == 1
@@ -712,7 +719,7 @@ class TestSessionRegistry:
     async def test_emit_to_subscribed_session(self):
         """Events are delivered to subscribed sessions."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status")
+        mcp.declare_event("myapp/status", kind="content")
 
         received_notifications: list[Any] = []
 
@@ -744,7 +751,7 @@ class TestSessionRegistry:
     async def test_emit_to_multiple_sessions(self):
         """Events are broadcast to all matching sessions."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status")
+        mcp.declare_event("myapp/status", kind="content")
 
         received: dict[str, list] = {}
 
@@ -789,7 +796,7 @@ class TestSessionRegistry:
     async def test_emit_failure_does_not_block_others(self):
         """Delivery failure to one session does not prevent delivery to others."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status")
+        mcp.declare_event("myapp/status", kind="content")
 
         delivered_to: list[tuple[str, Any]] = []
 
@@ -855,7 +862,7 @@ class TestProtocolRoundTrip:
         from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCResponse
 
         mcp_server = FastMCP("test-events")
-        mcp_server.declare_event("myapp/status", description="Status updates")
+        mcp_server.declare_event("myapp/status", kind="content", description="Status updates")
 
         async with mcp_server._lifespan_manager():
             async with create_client_server_memory_streams() as (
@@ -1016,10 +1023,9 @@ class TestProtocolRoundTrip:
         )
 
         mcp_server = FastMCP("test-events-list")
-        mcp_server.declare_event(
-            "myapp/status", description="Status updates", retained=True
+        mcp_server.declare_event("myapp/status", kind="content", description="Status updates", retained=True
         )
-        mcp_server.declare_event("myapp/logs", description="Log stream")
+        mcp_server.declare_event("myapp/logs", kind="content", description="Log stream")
 
         async with mcp_server._lifespan_manager():
             async with create_client_server_memory_streams() as (
@@ -1209,7 +1215,7 @@ class TestErrorPaths:
         )
 
         mcp_server = FastMCP("test-event-error")
-        mcp_server.declare_event("myapp/status")
+        mcp_server.declare_event("myapp/status", kind="content")
 
         async with mcp_server._lifespan_manager():
             async with create_client_server_memory_streams() as (
@@ -1296,13 +1302,13 @@ class TestTopicDepthEnforcement:
         mcp_server = FastMCP("test")
         # 9 segments should be rejected
         with pytest.raises(ValueError, match="maximum depth is 8"):
-            mcp_server.declare_event("a/b/c/d/e/f/g/h/i")
+            mcp_server.declare_event("a/b/c/d/e/f/g/h/i", kind="content")
 
     def test_declare_event_accepts_max_depth(self):
         """declare_event accepts patterns with exactly 8 segments."""
         mcp_server = FastMCP("test")
         # Exactly 8 segments should work
-        desc = mcp_server.declare_event("a/b/c/d/e/f/g/h")
+        desc = mcp_server.declare_event("a/b/c/d/e/f/g/h", kind="content")
         assert desc.pattern == "a/b/c/d/e/f/g/h"
 
     async def test_subscribe_rejects_deep_pattern(self):
@@ -1318,7 +1324,7 @@ class TestTopicDepthEnforcement:
         )
 
         mcp_server = FastMCP("test")
-        mcp_server.declare_event("myapp/status")
+        mcp_server.declare_event("myapp/status", kind="content")
 
         async with mcp_server._lifespan_manager():
             async with create_client_server_memory_streams() as (
@@ -1588,14 +1594,14 @@ class TestInitializeResultSessionId:
 
 
 # ---------------------------------------------------------------------------
-# {session_id} default enforcement (no authorize callback)
+# {agent_id} default enforcement (no authorize callback)
 # ---------------------------------------------------------------------------
 
 
-class TestSessionIdEnforcement:
+class TestAgentIdEnforcement:
     async def test_can_subscribe_to_own_session_topic(self):
         mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{session_id}/messages")
+        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -1610,7 +1616,7 @@ class TestSessionIdEnforcement:
 
     async def test_cannot_subscribe_to_other_session_topic(self):
         mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{session_id}/messages")
+        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -1626,7 +1632,7 @@ class TestSessionIdEnforcement:
 
     async def test_cannot_use_single_wildcard_in_session_slot(self):
         mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{session_id}/messages")
+        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -1640,7 +1646,7 @@ class TestSessionIdEnforcement:
 
     async def test_cannot_use_hash_wildcard_over_session_slot(self):
         mcp = FastMCP("test")
-        mcp.declare_event("spellbook/sessions/{session_id}/messages")
+        mcp.declare_event("spellbook/sessions/{agent_id}/messages", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -1654,7 +1660,7 @@ class TestSessionIdEnforcement:
 
     async def test_public_topic_allows_any_subscriber(self):
         mcp = FastMCP("test")
-        mcp.declare_event("spellbook/server/status")
+        mcp.declare_event("spellbook/server/status", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -1668,7 +1674,7 @@ class TestSessionIdEnforcement:
     async def test_non_magic_placeholder_allows_wildcard(self):
         """``{project}`` is not magic, so wildcards are permitted in that slot."""
         mcp = FastMCP("test")
-        mcp.declare_event("spellbook/builds/{project}/status")
+        mcp.declare_event("spellbook/builds/{project}/status", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -1694,7 +1700,7 @@ class TestAuthorizeCallback:
             return True
 
         mcp = FastMCP("test")
-        mcp.declare_event("rooms/{room}/chat", authorize=authorize)
+        mcp.declare_event("rooms/{room}/chat", kind="content", authorize=authorize)
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -1712,7 +1718,7 @@ class TestAuthorizeCallback:
             return True
 
         mcp = FastMCP("test")
-        mcp.declare_event("rooms/{room}/chat", authorize=authorize)
+        mcp.declare_event("rooms/{room}/chat", kind="content", authorize=authorize)
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -1727,7 +1733,7 @@ class TestAuthorizeCallback:
             return False
 
         mcp = FastMCP("test")
-        mcp.declare_event("rooms/{room}/chat", authorize=authorize)
+        mcp.declare_event("rooms/{room}/chat", kind="content", authorize=authorize)
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -1744,7 +1750,7 @@ class TestAuthorizeCallback:
             raise RuntimeError("intentional failure for test")
 
         mcp = FastMCP("test")
-        mcp.declare_event("rooms/{room}/chat", authorize=authorize)
+        mcp.declare_event("rooms/{room}/chat", kind="content", authorize=authorize)
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -1763,13 +1769,13 @@ class TestAuthorizeCallback:
         ), "Expected a warning log when authorize raises"
 
     async def test_authorize_callback_overrides_default_session_id_check(self):
-        """An authorize callback fully replaces the {session_id} default policy."""
+        """An authorize callback fully replaces the {agent_id} default policy."""
 
         def authorize(session_id: str, params: dict[str, str]) -> bool:
             return True
 
         mcp = FastMCP("test")
-        mcp.declare_event("sessions/{session_id}/messages", authorize=authorize)
+        mcp.declare_event("sessions/{agent_id}/messages", kind="content", authorize=authorize)
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -1802,7 +1808,7 @@ class TestTargetSessionIds:
     async def test_emit_without_target_session_ids_broadcasts(self):
         """Default behavior: every matching subscriber receives the event."""
         mcp = FastMCP("test")
-        mcp.declare_event("public/topic")
+        mcp.declare_event("public/topic", kind="content")
 
         sinks: dict[str, list[Any]] = {}
 
@@ -1839,7 +1845,7 @@ class TestTargetSessionIds:
 
     async def test_emit_with_target_session_ids_filters(self):
         mcp = FastMCP("test")
-        mcp.declare_event("public/topic")
+        mcp.declare_event("public/topic", kind="content")
 
         sinks: dict[str, list[Any]] = {}
 
@@ -1881,7 +1887,7 @@ class TestTargetSessionIds:
     async def test_emit_with_target_session_ids_intersection_empty_is_noop(self):
         """A target list that overlaps no subscribers delivers nothing, no error."""
         mcp = FastMCP("test")
-        mcp.declare_event("public/topic")
+        mcp.declare_event("public/topic", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -1901,8 +1907,8 @@ class TestTargetSessionIds:
     async def test_emit_with_target_session_ids_and_subscription_mismatch(self):
         """Targeted session that lacks a matching subscription does not receive."""
         mcp = FastMCP("test")
-        mcp.declare_event("public/topic")
-        mcp.declare_event("other/topic")
+        mcp.declare_event("public/topic", kind="content")
+        mcp.declare_event("other/topic", kind="content")
 
         async with Client(mcp) as _c1:
             s1 = _get_active_session(mcp)
@@ -1932,7 +1938,7 @@ class TestTargetSessionIds:
     async def test_context_emit_event_supports_target_session_ids(self):
         """Context.emit_event passes target_session_ids through to FastMCP.emit_event."""
         mcp = FastMCP("test")
-        mcp.declare_event("public/topic")
+        mcp.declare_event("public/topic", kind="content")
 
         @mcp.tool
         async def fan_out(target: str, ctx: Context) -> str:
@@ -1991,15 +1997,15 @@ class TestOverlappingDeclarations:
         authorization, so the subscription must be rejected."""
         mcp = FastMCP("test")
         # Permissive: no auth required
-        mcp.declare_event("myapp/events")
+        mcp.declare_event("myapp/events", kind="content")
         # Restrictive: session-scoped
-        mcp.declare_event("myapp/{session_id}")
+        mcp.declare_event("myapp/{agent_id}", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
             result = await _subscribe_via_handler(mcp, session, ["myapp/events"])
 
-        # The {session_id} declaration also matches "myapp/events" (single
+        # The {agent_id} declaration also matches "myapp/events" (single
         # segment in the param slot). Its default policy rejects because
         # "events" != the subscriber's session_id.
         assert result.subscribed == []
@@ -2010,7 +2016,7 @@ class TestOverlappingDeclarations:
         """A simple exact-match subscription with no overlapping declarations
         continues to work after removing the early-return short-circuit."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/events")
+        mcp.declare_event("myapp/events", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -2024,8 +2030,8 @@ class TestOverlappingDeclarations:
         """Two overlapping permissive declarations both authorize, so the
         subscription succeeds."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/events")
-        mcp.declare_event("myapp/{project}")  # non-magic param, permissive
+        mcp.declare_event("myapp/events", kind="content")
+        mcp.declare_event("myapp/{project}", kind="content")  # non-magic param, permissive
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -2048,7 +2054,7 @@ class TestMalformedPatternHandling:
         mcp = FastMCP("test")
         # Use a parameterized declaration whose forward regex will match the
         # malformed subscription pattern (after wildcard replacement to "x").
-        mcp.declare_event("myapp/{kind}/messages")
+        mcp.declare_event("myapp/{kind}/messages", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -2062,9 +2068,9 @@ class TestMalformedPatternHandling:
         """A batch subscribe with one valid and one malformed pattern should
         succeed for the valid one and reject the malformed one."""
         mcp = FastMCP("test")
-        mcp.declare_event("valid/topic")
+        mcp.declare_event("valid/topic", kind="content")
         # Parameterized so forward regex matches bad/#/topic after wildcard sub
-        mcp.declare_event("bad/{kind}/topic")
+        mcp.declare_event("bad/{kind}/topic", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -2081,7 +2087,7 @@ class TestMalformedPatternHandling:
     async def test_valid_hash_terminal_still_works(self):
         """Subscribe to ``myapp/#`` (terminal #) must succeed."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status")
+        mcp.declare_event("myapp/status", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -2094,7 +2100,7 @@ class TestMalformedPatternHandling:
     async def test_empty_pattern_rejected(self):
         """Subscribe to an empty string should be rejected gracefully."""
         mcp = FastMCP("test")
-        mcp.declare_event("myapp/status")
+        mcp.declare_event("myapp/status", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -2110,7 +2116,7 @@ class TestWildcardSmuggling:
         wildcard must be rejected even if it ALSO matches an open declaration.
 
         Two declarations:
-            - ``sessions/{session_id}/messages`` (private, session-scoped)
+            - ``sessions/{agent_id}/messages`` (private, session-scoped)
             - ``sessions/{room}/public`` (open; ``{room}`` is non-magic)
 
         The subscribe pattern ``sessions/+/messages`` is a wildcard superset
@@ -2118,8 +2124,8 @@ class TestWildcardSmuggling:
         cover other sessions' private messages.
         """
         mcp = FastMCP("test")
-        mcp.declare_event("sessions/{session_id}/messages")
-        mcp.declare_event("sessions/{room}/public")
+        mcp.declare_event("sessions/{agent_id}/messages", kind="content")
+        mcp.declare_event("sessions/{room}/public", kind="content")
 
         async with Client(mcp) as _client:
             session = _get_active_session(mcp)
@@ -2154,33 +2160,31 @@ class TestAutoSourceFromToolName:
         """When a tool emits an event without explicit source, source is auto-set
         to 'tool/<tool_name>' and is present in the delivered notification."""
         mcp_server = FastMCP("test")
-        mcp_server.declare_event("myapp/notifications")
+        mcp_server.declare_event("myapp/notifications", kind="content")
 
         captured_sources: list[str | None] = []
         original_emit = mcp_server.emit_event
 
         async def tracking_emit(
             topic: str,
-            payload: Any,
+            payload: Any = None,
             *,
+            priority: str = "normal",
+            source: str | None = None,
+            expires_at: str | None = None,
             event_id: str | None = None,
             retained: bool | None = None,
-            source: str | None = None,
-            correlation_id: str | None = None,
-            requested_effects: list[EventEffect] | None = None,
-            expires_at: str | None = None,
             target_session_ids: Any = None,
         ) -> None:
             captured_sources.append(source)
             await original_emit(
                 topic,
                 payload,
+                priority=priority,
+                source=source,
+                expires_at=expires_at,
                 event_id=event_id,
                 retained=retained,
-                source=source,
-                correlation_id=correlation_id,
-                requested_effects=requested_effects,
-                expires_at=expires_at,
                 target_session_ids=target_session_ids,
             )
 
@@ -2230,33 +2234,31 @@ class TestAutoSourceFromToolName:
         """When a tool provides explicit source, it is not overridden and is
         present in the delivered notification."""
         mcp_server = FastMCP("test")
-        mcp_server.declare_event("myapp/notifications")
+        mcp_server.declare_event("myapp/notifications", kind="content")
 
         captured_sources: list[str | None] = []
         original_emit = mcp_server.emit_event
 
         async def tracking_emit(
             topic: str,
-            payload: Any,
+            payload: Any = None,
             *,
+            priority: str = "normal",
+            source: str | None = None,
+            expires_at: str | None = None,
             event_id: str | None = None,
             retained: bool | None = None,
-            source: str | None = None,
-            correlation_id: str | None = None,
-            requested_effects: list[EventEffect] | None = None,
-            expires_at: str | None = None,
             target_session_ids: Any = None,
         ) -> None:
             captured_sources.append(source)
             await original_emit(
                 topic,
                 payload,
+                priority=priority,
+                source=source,
+                expires_at=expires_at,
                 event_id=event_id,
                 retained=retained,
-                source=source,
-                correlation_id=correlation_id,
-                requested_effects=requested_effects,
-                expires_at=expires_at,
                 target_session_ids=target_session_ids,
             )
 
@@ -2310,7 +2312,7 @@ class TestAutoSourceFromToolName:
         """When emit_event is called directly on the server (not via a tool),
         source remains None in the delivered notification."""
         mcp_server = FastMCP("test")
-        mcp_server.declare_event("myapp/status")
+        mcp_server.declare_event("myapp/status", kind="content")
 
         received_notifications: list[Any] = []
 

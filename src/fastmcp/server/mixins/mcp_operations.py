@@ -74,20 +74,22 @@ def _extract_topic_params(
     return params
 
 
-def _check_session_id_enforcement(
+def _check_agent_id_enforcement(
     declared_segments: list[str],
     subscribe_segments: list[str],
     session_id: str,
 ) -> bool:
-    """Enforce the ``{session_id}`` magic-placeholder convention.
+    """Enforce the ``{agent_id}`` magic-placeholder convention.
 
-    For each segment in the declared pattern that is ``{session_id}``, the
+    For each segment in the declared pattern that is ``{agent_id}``, the
     corresponding segment in the subscribe pattern MUST be the literal
-    ``session_id`` string. Wildcards or any other value cause rejection.
-    Handles the ``#`` multi-segment wildcard: if ``#`` in the subscribe
-    pattern would consume a ``{session_id}`` declared segment, reject.
+    ``session_id`` string (the subscriber's MCP transport session UUID,
+    which fastmcp uses as the agent identity for default enforcement).
+    Wildcards or any other value cause rejection. Handles the ``#``
+    multi-segment wildcard: if ``#`` in the subscribe pattern would consume
+    an ``{agent_id}`` declared segment, reject.
 
-    Declared patterns with no ``{session_id}`` placeholder always pass.
+    Declared patterns with no ``{agent_id}`` placeholder always pass.
     """
     hash_index: int | None = None
     for i, seg in enumerate(subscribe_segments):
@@ -95,13 +97,13 @@ def _check_session_id_enforcement(
             hash_index = i
             break
     for index, declared_seg in enumerate(declared_segments):
-        if declared_seg != "{session_id}":
+        if declared_seg != "{agent_id}":
             continue
         if hash_index is not None and index >= hash_index:
-            # "#" would wildcard over the session_id slot -- reject.
+            # "#" would wildcard over the agent_id slot -- reject.
             return False
         if index >= len(subscribe_segments):
-            # Subscribe pattern too short to cover the session_id slot and
+            # Subscribe pattern too short to cover the agent_id slot and
             # no `#` consumed it; this cannot happen if the patterns
             # genuinely match, but guard against it anyway.
             return False
@@ -660,21 +662,22 @@ class MCPOperationsMixin:
         """Check whether a subscribing session is authorized for a declared pattern.
 
         Applies the authorize-callback override if one is registered for
-        ``declared_pattern``. Otherwise enforces the ``{session_id}`` magic
+        ``declared_pattern``. Otherwise enforces the ``{agent_id}`` magic
         placeholder convention: for any segment in the declared pattern that
-        is ``{session_id}``, the corresponding segment in the subscribe
-        pattern must be the literal subscriber session UUID. Wildcards
-        (``+``, ``#``) or any other literal in that slot cause rejection.
+        is ``{agent_id}``, the corresponding segment in the subscribe
+        pattern must be the literal subscriber transport session UUID.
+        Wildcards (``+``, ``#``) or any other literal in that slot cause
+        rejection.
 
-        Non-``{session_id}`` ``{param}`` placeholders impose no restriction.
-        If the declared pattern contains no ``{session_id}`` and no authorize
+        Non-``{agent_id}`` ``{param}`` placeholders impose no restriction.
+        If the declared pattern contains no ``{agent_id}`` and no authorize
         callback is registered, all matching subscribers are allowed
         (legacy behavior).
 
         Handles the ``#`` (multi-segment wildcard) edge case: ``#`` must
         appear at the end of the subscribe pattern and consumes all
         remaining declared-pattern segments. If any consumed segment is
-        ``{session_id}``, the subscription is rejected.
+        ``{agent_id}``, the subscription is rejected.
 
         Returns True to allow the subscription, False to reject it.
         """
@@ -695,8 +698,8 @@ class MCPOperationsMixin:
                 )
                 return False
 
-        # Default policy: {session_id} enforcement if present in declared.
-        return _check_session_id_enforcement(
+        # Default policy: {agent_id} enforcement if present in declared.
+        return _check_agent_id_enforcement(
             declared_segments, subscribe_segments, session_id
         )
 
@@ -712,7 +715,7 @@ class MCPOperationsMixin:
 
         Handles both exact matches and wildcard patterns that could match
         declared topic patterns. For example, subscription pattern "myapp/+"
-        matches declared topic "myapp/{session_id}".
+        matches declared topic "myapp/{agent_id}".
 
         Uses regex-based matching in both directions: the subscription pattern
         is checked against declared patterns (with {param} as single-segment

@@ -14,7 +14,6 @@ from mcp import LoggingLevel, ServerSession
 from mcp.server.lowlevel.server import request_ctx
 from mcp.shared.context import RequestContext
 from mcp.types import (
-    EventEffect,
     GetPromptResult,
     ModelPreferences,
     Root,
@@ -789,14 +788,13 @@ class Context:
     async def emit_event(
         self,
         topic: str,
-        payload: Any,
+        payload: Any = None,
         *,
+        priority: Literal["urgent", "high", "normal", "low"] = "normal",
+        source: str | None = None,
+        expires_at: str | None = None,
         event_id: str | None = None,
         retained: bool | None = None,
-        source: str | None = None,
-        correlation_id: str | None = None,
-        requested_effects: list[EventEffect] | None = None,
-        expires_at: str | None = None,
         target_session_ids: Collection[str] | None = None,
     ) -> None:
         """Publish an event to all sessions subscribed to the given topic.
@@ -813,13 +811,16 @@ class Context:
 
         Args:
             topic: Concrete topic string (no wildcards).
-            payload: Event payload (any JSON-serializable value).
+            payload: Event payload (any JSON-serializable value). Optional;
+                     may be ``None`` for pure signal events.
+            priority: Delivery priority hint (``"urgent"``, ``"high"``,
+                      ``"normal"`` (default), or ``"low"``). Per MCP Events
+                      Spec v2.
+            source: Optional source identifier. Auto-set to ``tool/<name>``
+                    when called from a tool context if not provided.
+            expires_at: Optional ISO 8601 expiry timestamp.
             event_id: Optional event ID (auto-generated if not provided).
             retained: If True, store as retained value for the topic.
-            source: Optional source identifier.
-            correlation_id: Optional correlation ID.
-            requested_effects: Optional advisory effect hints for clients.
-            expires_at: Optional ISO 8601 expiry for retained values.
             target_session_ids: Optional defense-in-depth filter. When
                       provided, delivery is restricted to sessions whose
                       fastmcp session_id is in this collection. Used as a
@@ -833,12 +834,11 @@ class Context:
         await self.fastmcp.emit_event(
             topic=topic,
             payload=payload,
+            priority=priority,
+            source=source,
+            expires_at=expires_at,
             event_id=event_id,
             retained=retained,
-            source=source,
-            correlation_id=correlation_id,
-            requested_effects=requested_effects,
-            expires_at=expires_at,
             target_session_ids=target_session_ids,
         )
 

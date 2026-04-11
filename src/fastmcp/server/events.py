@@ -4,8 +4,8 @@ This module provides:
 - SubscriptionRegistry for managing session-to-topic subscriptions with MQTT wildcards
 - RetainedValueStore for storing the most recent event per topic
 
-Event types (EventEffect, EventTopicDescriptor, EventParams, etc.) are imported
-from the mcp SDK (mcp.types). This module re-exports them for convenience.
+Event types (EventTopicDescriptor, EventParams, etc.) are imported from the
+mcp SDK (mcp.types). This module re-exports them for convenience.
 
 NOTE: This is completely separate from ``event_store.py`` which handles
 SSE transport-level resumability for Streamable HTTP.
@@ -25,7 +25,6 @@ from datetime import datetime, timezone
 
 # Re-export event types from the SDK for convenience
 from mcp.types import (  # noqa: F401
-    EventEffect,
     EventEmitNotification,
     EventListRequest,
     EventListResult,

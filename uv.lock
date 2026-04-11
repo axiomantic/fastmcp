@@ -1561,8 +1561,8 @@ wheels = [
 
 [[package]]
 name = "mcp"
-version = "1.27.1.dev1+0ee3ed4"
-source = { git = "https://github.com/axiomantic/python-sdk.git?rev=mcp-events#0ee3ed4aa134afbd3a33f4b82f252cee90eeb865" }
+version = "1.27.1.dev15+8844b1a"
+source = { git = "https://github.com/axiomantic/python-sdk.git?rev=mcp-events#8844b1a2e2dc2bda69183a32ee88cfb9334af291" }
 dependencies = [
     { name = "anyio" },
     { name = "httpx" },
