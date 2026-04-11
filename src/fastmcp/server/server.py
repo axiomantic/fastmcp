@@ -11,6 +11,7 @@ from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Collection,
     Sequence,
 )
 from contextlib import (
@@ -33,12 +34,15 @@ from mcp.types import (
     Annotations,
     AnyFunction,
     CallToolRequestParams,
+    EventTopicDescriptor,
+    RetainedEvent,
     ToolAnnotations,
 )
 from pydantic import AnyUrl
 from pydantic import ValidationError as PydanticValidationError
 from starlette.routing import BaseRoute
 from typing_extensions import Self
+from ulid import ULID
 
 import fastmcp
 import fastmcp.server
@@ -64,6 +68,10 @@ from fastmcp.prompts.function_prompt import FunctionPrompt
 from fastmcp.resources.base import Resource, ResourceResult
 from fastmcp.resources.template import ResourceTemplate
 from fastmcp.server.auth import AuthCheck, AuthContext, AuthProvider, run_auth_checks
+from fastmcp.server.events import (
+    RetainedValueStore,
+    SubscriptionRegistry,
+)
 from fastmcp.server.lifespan import Lifespan
 from fastmcp.server.low_level import LowLevelServer
 from fastmcp.server.middleware import Middleware, MiddlewareContext
@@ -94,6 +102,7 @@ if TYPE_CHECKING:
     from fastmcp.client.client import FastMCP1Server
     from fastmcp.client.sampling import SamplingHandler
     from fastmcp.client.transports import ClientTransport, ClientTransportT
+    from fastmcp.server.low_level import MiddlewareServerSession
     from fastmcp.server.providers.openapi import ComponentFn as OpenAPIComponentFn
     from fastmcp.server.providers.openapi import RouteMap
     from fastmcp.server.providers.openapi import RouteMapFn as OpenAPIRouteMapFn
@@ -297,6 +306,23 @@ class FastMCP(
         # Docket and Worker instances (set during lifespan for cross-task access)
         self._docket = None
         self._worker = None
+
+        # Event topics and subscription infrastructure
+        self._event_topics: dict[str, EventTopicDescriptor] = {}
+        # Per-declared-pattern authorization callbacks. Stored separately from
+        # EventTopicDescriptor (a python-sdk protocol type we do not mutate).
+        # Key: declared pattern string; value: callback(session_id, topic_params)
+        # returning True to allow the subscription, False to reject it.
+        self._event_topic_authorize: dict[
+            str, Callable[[str, dict[str, str]], bool]
+        ] = {}
+        # Cached regex compiled from each declared topic pattern's {param}
+        # placeholders, used to accelerate subscription pattern matching.
+        # Keyed by declared pattern string; populated lazily on first use.
+        self._declared_topic_regex_cache: dict[str, re.Pattern[str]] = {}
+        self._subscription_registry: SubscriptionRegistry = SubscriptionRegistry()
+        self._retained_store: RetainedValueStore = RetainedValueStore()
+        self._active_sessions: dict[str, MiddlewareServerSession] = {}
 
         self._additional_http_routes: list[BaseRoute] = []
 
@@ -1109,7 +1135,7 @@ class FastMCP(
         # For mounted servers, the parent's provider sets fn_key to the
         # namespaced key before delegating, ensuring correct Docket routing.
 
-        async with fastmcp.server.context.Context(fastmcp=self) as ctx:
+        async with fastmcp.server.context.Context(fastmcp=self, _tool_name=name) as ctx:
             if run_middleware:
                 mw_context = MiddlewareContext[CallToolRequestParams](
                     message=mcp.types.CallToolRequestParams(
@@ -1618,6 +1644,334 @@ class FastMCP(
         )
 
         return result
+
+    # -------------------------------------------------------------------------
+    # Event declaration and publishing
+    # -------------------------------------------------------------------------
+
+    _MAX_TOPIC_DEPTH = 8
+
+    def declare_event(
+        self,
+        pattern: str,
+        *,
+        kind: Literal["content", "signal"],
+        description: str | None = None,
+        suggested_handle: Literal[
+            "drop", "silent", "notify", "ask", "inject", "interrupt"
+        ]
+        | None = None,
+        retained: bool = False,
+        schema: dict[str, Any] | None = None,
+        authorize: Callable[[str, dict[str, str]], bool] | None = None,
+    ) -> EventTopicDescriptor:
+        """Declare an event topic that this server can publish to.
+
+        Args:
+            pattern: Topic pattern (e.g., "agents/{agent_id}/messages").
+                     ``{param}`` placeholders describe parameterized segments.
+                     Maximum depth: 8 segments.
+            kind: REQUIRED. Either ``"content"`` (payloads are suitable for
+                  LLM context injection) or ``"signal"`` (machine-only events
+                  intended for programmatic consumption, not LLM injection).
+            description: Human-readable description of the topic.
+            suggested_handle: Optional advisory hint for how clients SHOULD
+                              handle events on this topic. One of
+                              ``drop``, ``silent``, ``notify``, ``ask``,
+                              ``inject``, ``interrupt``. Clients remain free
+                              to override based on their own configuration
+                              (zero-trust model).
+            retained: Whether the most recent event per topic is stored and
+                      delivered to new subscribers on subscribe.
+            schema: Optional JSON Schema for the event payload.
+            authorize: Optional callback invoked when a client subscribes to a
+                       pattern that matches this declaration. Receives
+                       ``(session_id, topic_params)`` and returns True to
+                       permit the subscription or False to reject it with
+                       ``reason="permission_denied"``. ``topic_params`` is a
+                       dict mapping each placeholder name in the declared
+                       pattern to the value supplied by the subscribing
+                       pattern: either a literal string, the wildcard
+                       character ``"+"`` (single segment wildcard), or
+                       ``"#"`` (multi-segment wildcard).
+
+        Authorization model:
+            By default any subscriber whose subscribe pattern matches a
+            declared topic is allowed. Per-agent or per-tenant isolation
+            is opt-in via an explicit ``authorize`` callback. The callback
+            is fully responsible for deciding whether the subscription is
+            permitted; fastmcp applies no additional policy.
+
+            Per MCP Events Spec v2, ``{agent_id}`` is an application-level
+            identity placeholder declared by the server and resolved by
+            the client before subscribing. It has no special meaning in
+            fastmcp's authorization path: the transport session UUID is
+            not the agent identity, and multiple agents may share one
+            transport. Servers that want to gate subscriptions by agent
+            identity should register an ``authorize`` callback and
+            consult ``topic_params["agent_id"]`` together with any
+            out-of-band binding between sessions and agent identities.
+
+        Returns:
+            The registered EventTopicDescriptor.
+
+        Raises:
+            ValueError: If pattern has more than 8 segments.
+        """
+        segments = pattern.split("/")
+        if len(segments) > self._MAX_TOPIC_DEPTH:
+            raise ValueError(
+                f"Topic pattern has {len(segments)} segments, "
+                f"maximum depth is {self._MAX_TOPIC_DEPTH}: {pattern!r}"
+            )
+        descriptor = EventTopicDescriptor(
+            pattern=pattern,
+            kind=kind,
+            description=description,
+            suggestedHandle=suggested_handle,
+            retained=retained,
+            schema=schema,
+        )
+        self._event_topics[pattern] = descriptor
+        if authorize is not None:
+            self._event_topic_authorize[pattern] = authorize
+        else:
+            # Clear any stale callback from a prior declaration of the same
+            # pattern so redeclaration behaves predictably.
+            self._event_topic_authorize.pop(pattern, None)
+        return descriptor
+
+    @staticmethod
+    def _topic_matches_pattern(concrete_topic: str, declared_pattern: str) -> bool:
+        """Check if a concrete topic matches a declared pattern with {param} placeholders.
+
+        Compares segment-by-segment: literal segments must match exactly,
+        ``{param}`` segments match any single non-empty segment.
+        """
+        if not concrete_topic or not declared_pattern:
+            return False
+        concrete_parts = concrete_topic.split("/")
+        pattern_parts = declared_pattern.split("/")
+        if any(not s for s in concrete_parts) or any(not s for s in pattern_parts):
+            return False
+        if len(concrete_parts) != len(pattern_parts):
+            return False
+        for concrete_seg, pattern_seg in zip(
+            concrete_parts, pattern_parts, strict=True
+        ):
+            if pattern_seg.startswith("{") and pattern_seg.endswith("}"):
+                continue  # {param} matches any single segment
+            if concrete_seg != pattern_seg:
+                return False
+        return True
+
+    def _find_topic_descriptor(self, topic: str) -> EventTopicDescriptor | None:
+        """Find the EventTopicDescriptor for a concrete topic.
+
+        Tries a direct lookup first, then falls back to segment-by-segment
+        matching against declared parameterized patterns.
+        """
+        # Direct match (fast path)
+        descriptor = self._event_topics.get(topic)
+        if descriptor is not None:
+            return descriptor
+        # Fall back to parameterized pattern matching
+        for pattern, desc in self._event_topics.items():
+            if self._topic_matches_pattern(topic, pattern):
+                return desc
+        return None
+
+    def event(
+        self,
+        pattern: str,
+        *,
+        kind: Literal["content", "signal"],
+        description: str | None = None,
+        suggested_handle: Literal[
+            "drop", "silent", "notify", "ask", "inject", "interrupt"
+        ]
+        | None = None,
+        retained: bool = False,
+        authorize: Callable[[str, dict[str, str]], bool] | None = None,
+    ) -> Callable[[F], F]:
+        """Decorator to declare an event topic.
+
+        The decorated function's return type annotation is used to generate
+        the payload JSON Schema. The function itself is not called automatically;
+        it serves as a schema source and can be called manually to construct
+        payloads.
+
+        Example::
+
+            @mcp.event("myapp/status", kind="content")
+            def status_event() -> dict:
+                '''Server status updates.'''
+                ...
+
+        Args:
+            pattern: Topic pattern for the event.
+            kind: REQUIRED. ``"content"`` or ``"signal"``. See
+                  ``declare_event`` for full semantics.
+            description: Optional description (falls back to docstring).
+            suggested_handle: Optional advisory hint for client handle
+                              behavior. See ``declare_event`` for details.
+            retained: Whether to store the most recent value per topic.
+            authorize: Optional subscription authorization callback. See
+                       ``declare_event`` for full semantics.
+        """
+
+        def decorator(fn: F) -> F:
+            desc = description or (fn.__doc__.strip() if fn.__doc__ else None)
+
+            # Try to extract JSON Schema from the return type annotation
+            payload_schema: dict[str, Any] | None = None
+            import typing
+
+            hints = typing.get_type_hints(fn)
+            return_type = hints.get("return")
+            if return_type is not None and return_type is not type(None):
+                try:
+                    from pydantic import TypeAdapter
+
+                    adapter = TypeAdapter(return_type)
+                    payload_schema = adapter.json_schema()
+                except (TypeError, ValueError, PydanticValidationError):
+                    logger.debug(
+                        "Could not generate JSON schema for event %r return type %r",
+                        pattern,
+                        return_type,
+                    )
+
+            self.declare_event(
+                pattern,
+                kind=kind,
+                description=desc,
+                suggested_handle=suggested_handle,
+                retained=retained,
+                schema=payload_schema,
+                authorize=authorize,
+            )
+            return fn
+
+        return decorator
+
+    async def emit_event(
+        self,
+        topic: str,
+        payload: Any = None,
+        *,
+        priority: Literal["urgent", "high", "normal", "low"] = "normal",
+        source: str | None = None,
+        expires_at: str | None = None,
+        event_id: str | None = None,
+        retained: bool | None = None,
+        target_session_ids: Collection[str] | None = None,
+    ) -> None:
+        """Broadcast an event to all sessions subscribed to the given topic.
+
+        This is the instance-level method for publishing events from anywhere
+        (tools via ``ctx.emit_event()``, background tasks, lifespan code, etc.).
+
+        Delivery failures to individual sessions are logged but do not prevent
+        delivery to other sessions.
+
+        Args:
+            topic: Concrete topic string (no wildcards).
+            payload: Event payload (any JSON-serializable value). Optional;
+                     may be ``None`` for pure signal events whose topic alone
+                     carries the information.
+            priority: Delivery priority hint per MCP Events Spec v2. One of
+                      ``"urgent"``, ``"high"``, ``"normal"`` (default),
+                      ``"low"``. Only ``"urgent"`` may cancel in-progress
+                      LLM generation; the others influence when the client
+                      processes the event.
+            source: Optional source identifier (e.g., ``"tool/build"``,
+                    ``"spellbook/messaging"``).
+            expires_at: Optional ISO 8601 expiry timestamp. Servers SHOULD
+                        NOT emit events that are already expired; clients
+                        MUST drop events whose ``expires_at`` has passed.
+            event_id: Optional event ID (auto-generated ULID if not
+                      provided).
+            retained: If True, store as retained value for the topic.
+                      Defaults to the topic descriptor's ``retained``
+                      setting if declared.
+            target_session_ids: Optional defense-in-depth filter. When None
+                      (default), the event is delivered to every session whose
+                      subscriptions match the topic. When a collection is
+                      provided, the set of matching subscribers is
+                      intersected (AND logic) with this set so that only
+                      sessions whose ``_fastmcp_event_session_id`` is in
+                      ``target_session_ids`` receive the notification. An
+                      empty intersection is a silent no-op. This is intended
+                      as a routing safety net paired with subscription-time
+                      authorization; subscription auth is still the primary
+                      boundary.
+        """
+        if event_id is None:
+            event_id = str(ULID())
+
+        # Determine whether to retain based on topic descriptor if not explicit
+        if retained is None:
+            descriptor = self._find_topic_descriptor(topic)
+            retained = descriptor.retained if descriptor is not None else False
+
+        # Store retained value if applicable
+        if retained:
+            retained_event = RetainedEvent(
+                topic=topic,
+                eventId=event_id,
+                payload=payload,
+            )
+            await self._retained_store.set(topic, retained_event, expires_at=expires_at)
+
+        # Find matching sessions via subscription registry
+        matching_session_ids = await self._subscription_registry.match(topic)
+        if not matching_session_ids:
+            return
+
+        # Defense-in-depth routing filter: restrict delivery to the provided
+        # session-id whitelist. Empty intersection is a silent no-op.
+        if target_session_ids is not None:
+            target_set = set(target_session_ids)
+            matching_session_ids = [
+                sid for sid in matching_session_ids if sid in target_set
+            ]
+            if not matching_session_ids:
+                return
+
+        # Build the event notification
+        from mcp.types import EventEmitNotification, EventParams, ServerNotification
+
+        notification = EventEmitNotification(
+            params=EventParams(
+                topic=topic,
+                eventId=event_id,
+                payload=payload,
+                priority=priority,
+                retained=retained,
+                source=source,
+                expiresAt=expires_at,
+            ),
+        )
+
+        # Broadcast to matching active sessions in parallel so slow sessions
+        # don't block delivery to others.
+        async def _deliver(sid: str) -> None:
+            session = self._active_sessions.get(sid)
+            if session is None:
+                return
+            try:
+                await session.send_notification(cast(ServerNotification, notification))
+            except Exception:
+                logger.warning(
+                    f"Failed to deliver event to session {sid}",
+                    exc_info=True,
+                )
+
+        await asyncio.gather(
+            *[_deliver(sid) for sid in matching_session_ids],
+            return_exceptions=True,
+        )
 
     def add_resource(
         self, resource: Resource | Callable[..., Any]

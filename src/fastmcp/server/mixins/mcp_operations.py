@@ -24,6 +24,56 @@ logger = get_logger(__name__)
 PaginateT = TypeVar("PaginateT")
 
 
+def _is_placeholder(segment: str) -> bool:
+    """Return True if ``segment`` is a ``{param}`` placeholder."""
+    return len(segment) >= 2 and segment.startswith("{") and segment.endswith("}")
+
+
+def _placeholder_name(segment: str) -> str:
+    """Extract the name from a ``{param}`` placeholder segment."""
+    return segment[1:-1]
+
+
+def _extract_topic_params(
+    declared_segments: list[str],
+    subscribe_segments: list[str],
+) -> dict[str, str]:
+    """Build the ``topic_params`` dict passed to ``authorize`` callbacks.
+
+    For each placeholder segment in the declared pattern, determine the
+    substituted value from the corresponding subscribe-pattern segment. If
+    the subscribe pattern uses a single-segment wildcard (``+``), the value
+    is the literal string ``"+"``. If the subscribe pattern uses the
+    multi-segment wildcard (``#``), ALL placeholder slots at that position
+    or later receive the literal string ``"#"``.
+
+    Segments without placeholders do not contribute to the dict.
+    """
+    params: dict[str, str] = {}
+    hash_active = False
+    for index, declared_seg in enumerate(declared_segments):
+        if not _is_placeholder(declared_seg):
+            continue
+        name = _placeholder_name(declared_seg)
+        if hash_active:
+            params[name] = "#"
+            continue
+        if index >= len(subscribe_segments):
+            # Subscribe pattern is shorter than declared. This should only
+            # happen when `#` consumed earlier segments, which is handled
+            # above. Record a sentinel for safety.
+            params[name] = "#"
+            continue
+        sub_seg = subscribe_segments[index]
+        if sub_seg == "#":
+            params[name] = "#"
+            hash_active = True
+        else:
+            # Covers literal values and the "+" single-segment wildcard.
+            params[name] = sub_seg
+    return params
+
+
 def _apply_pagination(
     items: Sequence[PaginateT],
     cursor: str | None,
@@ -80,6 +130,9 @@ class MCPOperationsMixin:
         self._mcp_server.read_resource()(self._read_resource_mcp)
         self._mcp_server.get_prompt()(self._get_prompt_mcp)
         self._mcp_server.set_logging_level()(self._set_logging_level_mcp)
+
+        # Register event protocol handlers
+        self._setup_event_protocol_handlers()
 
         # Register SEP-1686 task protocol handlers
         self._setup_task_protocol_handlers()
@@ -371,3 +424,291 @@ class MCPOperationsMixin:
                 session._minimum_logging_level = level
         except LookupError:
             pass
+
+    # -------------------------------------------------------------------------
+    # Event protocol handlers
+    # -------------------------------------------------------------------------
+
+    def _setup_event_protocol_handlers(self: FastMCP) -> None:
+        """Register event protocol handlers through the SDK's request_handlers.
+
+        Event request types (EventSubscribeRequest, EventUnsubscribeRequest,
+        EventListRequest) are part of the SDK's ClientRequest union, so the
+        SDK's built-in dispatch routes them to registered handlers automatically.
+
+        Capabilities are advertised by the SDK based on the presence of
+        EventSubscribeRequest in request_handlers, and overridden by
+        LowLevelServer.get_capabilities() to include declared topic descriptors.
+        """
+        from fastmcp.server.events import (
+            EventListRequest,
+            EventSubscribeRequest,
+            EventUnsubscribeRequest,
+        )
+
+        server = self
+
+        def _check_events_capability() -> None:
+            """Raise -32601 if no event topics are declared."""
+            if not server._event_topics:
+                raise McpError(
+                    mcp.types.ErrorData(
+                        code=-32601,
+                        message="Method not found: server has no events capability",
+                    )
+                )
+
+        async def handle_subscribe(
+            req: EventSubscribeRequest,
+        ) -> mcp.types.ServerResult:
+            _check_events_capability()
+            result = await server._handle_subscribe_events(req)
+            return mcp.types.ServerResult(result)
+
+        async def handle_unsubscribe(
+            req: EventUnsubscribeRequest,
+        ) -> mcp.types.ServerResult:
+            _check_events_capability()
+            result = await server._handle_unsubscribe_events(req)
+            return mcp.types.ServerResult(result)
+
+        async def handle_list(req: EventListRequest) -> mcp.types.ServerResult:
+            _check_events_capability()
+            result = await server._handle_list_events(req)
+            return mcp.types.ServerResult(result)
+
+        server._mcp_server.request_handlers[EventSubscribeRequest] = handle_subscribe
+        server._mcp_server.request_handlers[EventUnsubscribeRequest] = (
+            handle_unsubscribe
+        )
+        server._mcp_server.request_handlers[EventListRequest] = handle_list
+
+    async def _handle_subscribe_events(
+        self, req: mcp.types.EventSubscribeRequest
+    ) -> mcp.types.EventSubscribeResult:
+        """Handle events/subscribe requests."""
+        from mcp.server.lowlevel.server import request_ctx
+
+        from fastmcp.server.events import (
+            EventSubscribeResult,
+            RejectedTopic,
+            SubscribedTopic,
+        )
+
+        server = cast("FastMCP", self)
+        logger.debug(f"[{server.name}] Handler called: events/subscribe")
+
+        # Get the session from the SDK request context
+        ctx = request_ctx.get()
+        session = ctx.session
+        session_id = getattr(session, "_fastmcp_event_session_id", None)
+
+        if session_id is None:
+            raise McpError(
+                mcp.types.ErrorData(
+                    code=-32603,
+                    message="No session context available for subscription",
+                )
+            )
+
+        topics = req.params.topics
+
+        subscribed: list[SubscribedTopic] = []
+        rejected: list[RejectedTopic] = []
+        retained_events = []
+        seen_event_ids: set[str] = set()
+
+        for pattern in topics:
+            # Validate topic depth (max 8 segments)
+            segments = pattern.split("/")
+            if len(segments) > server._MAX_TOPIC_DEPTH:
+                raise McpError(
+                    mcp.types.ErrorData(
+                        code=-32602,
+                        message=(
+                            f"Subscription pattern has {len(segments)} segments, "
+                            f"maximum depth is {server._MAX_TOPIC_DEPTH}: {pattern!r}"
+                        ),
+                    )
+                )
+
+            # Check if the pattern matches any declared topic
+            matched_declared = server._find_matching_declared_topics(pattern)
+            if not matched_declared:
+                rejected.append(RejectedTopic(pattern=pattern, reason="unknown_topic"))
+                continue
+
+            # Authorize the subscription against each declared pattern that
+            # the subscribe pattern matches. Require every match to
+            # authorize: a single denial rejects the whole subscription so
+            # a client cannot smuggle in a forbidden pattern by combining
+            # it with a permissive one via wildcards.
+            authorized = True
+            for declared_pattern in matched_declared:
+                if not server._authorize_subscription(
+                    declared_pattern, pattern, session_id
+                ):
+                    authorized = False
+                    break
+            if not authorized:
+                rejected.append(
+                    RejectedTopic(pattern=pattern, reason="permission_denied")
+                )
+                continue
+
+            try:
+                await server._subscription_registry.add(session_id, pattern)
+            except ValueError as e:
+                rejected.append(
+                    RejectedTopic(pattern=pattern, reason=f"invalid_pattern: {e}")
+                )
+                continue
+            subscribed.append(SubscribedTopic(pattern=pattern))
+
+            # Deliver retained values for this pattern (deduplicated)
+            matching = await server._retained_store.get_matching(pattern)
+            for evt in matching:
+                if evt.eventId not in seen_event_ids:
+                    seen_event_ids.add(evt.eventId)
+                    retained_events.append(evt)
+
+        return EventSubscribeResult(
+            subscribed=subscribed,
+            rejected=rejected,
+            retained=retained_events,
+        )
+
+    async def _handle_unsubscribe_events(
+        self, req: mcp.types.EventUnsubscribeRequest
+    ) -> mcp.types.EventUnsubscribeResult:
+        """Handle events/unsubscribe requests."""
+        from mcp.server.lowlevel.server import request_ctx
+
+        from fastmcp.server.events import EventUnsubscribeResult
+
+        server = cast("FastMCP", self)
+        logger.debug(f"[{server.name}] Handler called: events/unsubscribe")
+
+        ctx = request_ctx.get()
+        session = ctx.session
+        session_id = getattr(session, "_fastmcp_event_session_id", None)
+
+        topics = req.params.topics
+
+        unsubscribed: list[str] = []
+        if session_id is not None:
+            for pattern in topics:
+                await server._subscription_registry.remove(session_id, pattern)
+                unsubscribed.append(pattern)
+
+        return EventUnsubscribeResult(unsubscribed=unsubscribed)
+
+    async def _handle_list_events(
+        self, req: mcp.types.EventListRequest
+    ) -> mcp.types.EventListResult:
+        """Handle events/list requests."""
+        from fastmcp.server.events import EventListResult
+
+        server = cast("FastMCP", self)
+        logger.debug(f"[{server.name}] Handler called: events/list")
+
+        topics = list(server._event_topics.values())
+        return EventListResult(topics=topics)
+
+    def _authorize_subscription(
+        self: FastMCP,
+        declared_pattern: str,
+        subscribe_pattern: str,
+        session_id: str,
+    ) -> bool:
+        """Run the declared topic's authorize callback if one is registered.
+
+        Default policy is permissive: any subscriber that matches the topic
+        pattern is allowed. Per-agent or per-tenant isolation requires an
+        explicit authorize callback registered on the declared topic via
+        ``declare_event(authorize=...)``.
+
+        The callback receives ``(session_id, topic_params)`` where
+        ``topic_params`` maps each ``{param}`` placeholder name in the
+        declared pattern to the value supplied by the subscribe pattern
+        (a literal, ``"+"`` for a single-segment wildcard, or ``"#"`` for
+        the multi-segment wildcard). The callback returns True to allow
+        the subscription or False to reject it. If the callback raises,
+        the subscription is denied and a warning is logged.
+
+        Returns True to allow the subscription, False to reject it.
+        """
+        authorize_cb = self._event_topic_authorize.get(declared_pattern)
+        if authorize_cb is None:
+            return True
+        declared_segments = declared_pattern.split("/")
+        subscribe_segments = subscribe_pattern.split("/")
+        topic_params = _extract_topic_params(declared_segments, subscribe_segments)
+        try:
+            return bool(authorize_cb(session_id, topic_params))
+        except Exception:
+            logger.warning(
+                "authorize callback raised for declared topic %r; denying subscription",
+                declared_pattern,
+                exc_info=True,
+            )
+            return False
+
+    def _match_declared_topic(self: FastMCP, pattern: str) -> bool:
+        """Check whether a subscription pattern matches any declared event topic.
+
+        See ``_find_matching_declared_topics`` for the underlying logic.
+        """
+        return bool(self._find_matching_declared_topics(pattern))
+
+    def _find_matching_declared_topics(self: FastMCP, pattern: str) -> list[str]:
+        """Return the declared topic patterns that a subscription pattern matches.
+
+        Handles both exact matches and wildcard patterns that could match
+        declared topic patterns. For example, subscription pattern "myapp/+"
+        matches declared topic "myapp/{param}".
+
+        Uses regex-based matching in both directions: the subscription pattern
+        is checked against declared patterns (with {param} as single-segment
+        wildcards), and declared patterns are checked against the subscription
+        pattern (with + and # as MQTT wildcards).
+        """
+        import re as _re
+
+        from fastmcp.server.events import _pattern_to_regex
+
+        matches: list[str] = []
+
+        for declared_pattern in self._event_topics:
+            # Forward: build regex from declared pattern's {param} placeholders
+            # and test whether the subscription pattern (with wildcards replaced
+            # by a synthetic single-segment value) matches.
+            declared_regex = self._declared_topic_regex_cache.get(declared_pattern)
+            if declared_regex is None:
+                declared_regex_parts = []
+                for segment in declared_pattern.split("/"):
+                    if segment.startswith("{") and segment.endswith("}"):
+                        declared_regex_parts.append("[^/]+")
+                    else:
+                        declared_regex_parts.append(_re.escape(segment))
+                declared_regex = _re.compile("^" + "/".join(declared_regex_parts) + "$")
+                self._declared_topic_regex_cache[declared_pattern] = declared_regex
+
+            # Replace MQTT wildcards with a synthetic literal segment for
+            # testing against the declared pattern regex.
+            test_pattern = _re.sub(r"[+#]", "x", pattern)
+            if declared_regex.match(test_pattern):
+                matches.append(declared_pattern)
+                continue
+
+            # Reverse: does the declared pattern (with {param} replaced by a
+            # synthetic literal) match the subscription pattern's MQTT regex?
+            concrete_declared = _re.sub(r"\{[^}]+\}", "x", declared_pattern)
+            try:
+                sub_regex = _pattern_to_regex(pattern)
+                if sub_regex.match(concrete_declared):
+                    matches.append(declared_pattern)
+            except ValueError:
+                continue
+
+        return matches

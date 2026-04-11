@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import weakref
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -193,6 +193,7 @@ class Context:
         *,
         task_id: str | None = None,
         origin_request_id: str | None = None,
+        _tool_name: str | None = None,
     ):
         self._fastmcp: weakref.ref[FastMCP] = weakref.ref(fastmcp)
         self._session: ServerSession | None = session  # For state ops during init
@@ -200,6 +201,8 @@ class Context:
         # Background task support (SEP-1686)
         self._task_id: str | None = task_id
         self._origin_request_id: str | None = origin_request_id
+        # Tool name for auto-source in emit_event
+        self._tool_name: str | None = _tool_name
         # Request-scoped state for non-serializable values (serializable=False)
         self._request_state: dict[str, Any] = {}
 
@@ -241,6 +244,14 @@ class Context:
         if self.request_context is not None:
             return str(self.request_context.request_id)
         return self._origin_request_id
+
+    @property
+    def tool_name(self) -> str | None:
+        """Get the tool name if this context was created for a tool call.
+
+        Returns None if the context was not created from a call_tool invocation.
+        """
+        return self._tool_name
 
     @property
     def fastmcp(self) -> FastMCP:
@@ -772,6 +783,63 @@ class Context:
             message=message,
             logger_name=logger_name,
             extra=extra,
+        )
+
+    async def emit_event(
+        self,
+        topic: str,
+        payload: Any = None,
+        *,
+        priority: Literal["urgent", "high", "normal", "low"] = "normal",
+        source: str | None = None,
+        expires_at: str | None = None,
+        event_id: str | None = None,
+        retained: bool | None = None,
+        target_session_ids: Collection[str] | None = None,
+    ) -> None:
+        """Publish an event to all sessions subscribed to the given topic.
+
+        This delegates to the FastMCP instance's ``emit_event()`` method,
+        which broadcasts to all matching subscribers across all active sessions.
+
+        Example::
+
+            @server.tool
+            async def notify(ctx: Context, message: str) -> str:
+                await ctx.emit_event("myapp/notifications", {"text": message})
+                return "sent"
+
+        Args:
+            topic: Concrete topic string (no wildcards).
+            payload: Event payload (any JSON-serializable value). Optional;
+                     may be ``None`` for pure signal events.
+            priority: Delivery priority hint (``"urgent"``, ``"high"``,
+                      ``"normal"`` (default), or ``"low"``). Per MCP Events
+                      Spec v2.
+            source: Optional source identifier. Auto-set to ``tool/<name>``
+                    when called from a tool context if not provided.
+            expires_at: Optional ISO 8601 expiry timestamp.
+            event_id: Optional event ID (auto-generated if not provided).
+            retained: If True, store as retained value for the topic.
+            target_session_ids: Optional defense-in-depth filter. When
+                      provided, delivery is restricted to sessions whose
+                      fastmcp session_id is in this collection. Used as a
+                      routing safety net alongside subscription-time
+                      authorization; see ``FastMCP.emit_event`` for details.
+        """
+        # Auto-set source from tool name when not explicitly provided
+        if source is None and self._tool_name is not None:
+            source = f"tool/{self._tool_name}"
+
+        await self.fastmcp.emit_event(
+            topic=topic,
+            payload=payload,
+            priority=priority,
+            source=source,
+            expires_at=expires_at,
+            event_id=event_id,
+            retained=retained,
+            target_session_ids=target_session_ids,
         )
 
     async def list_roots(self) -> list[Root]:

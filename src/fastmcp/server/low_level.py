@@ -36,6 +36,8 @@ logger = get_logger(__name__)
 class MiddlewareServerSession(ServerSession):
     """ServerSession that routes initialization requests through FastMCP middleware."""
 
+    _fastmcp_event_session_id: str | None = None
+
     def __init__(self, fastmcp: FastMCP, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._fastmcp_ref: weakref.ref[FastMCP] = weakref.ref(fastmcp)
@@ -64,7 +66,7 @@ class MiddlewareServerSession(ServerSession):
         caps = client_params.capabilities
         if caps is None:
             return False
-        # ClientCapabilities uses extra="allow" — extensions is an extra field
+        # ClientCapabilities uses extra="allow" -- extensions is an extra field
         extras = caps.model_extra or {}
         extensions: dict[str, Any] | None = extras.get("extensions")
         if not extensions:
@@ -99,9 +101,22 @@ class MiddlewareServerSession(ServerSession):
             original_respond = responder.respond
 
             async def capturing_respond(
-                response: mcp.types.ServerResult,
+                response: mcp.types.ServerResult | mcp.types.ErrorData,
             ) -> None:
                 nonlocal captured_response
+                # Inject the fastmcp session_id into InitializeResult._meta so
+                # clients can learn their own session identifier synchronously
+                # during the initialize handshake. This value is the same UUID
+                # set on the session in LowLevelServer.run() and used by the
+                # event subscription system for cross-session authorization.
+                if not isinstance(response, mcp.types.ErrorData) and isinstance(
+                    response.root, mcp.types.InitializeResult
+                ):
+                    session_id = getattr(self, "_fastmcp_event_session_id", None)
+                    if session_id is not None:
+                        existing_meta = response.root.meta or {}
+                        merged_meta = {**existing_meta, "session_id": session_id}
+                        response.root.meta = merged_meta
                 captured_response = response
                 return await original_respond(response)
 
@@ -211,8 +226,21 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
         # Set tasks as a first-class field (not experimental) per SEP-1686
         capabilities.tasks = get_task_capabilities()
 
+        # Event handlers are always registered so the SDK's get_capabilities
+        # will set events_capability. Override: only advertise when topics
+        # are actually declared, and include the declared topic descriptors.
+        if self.fastmcp._event_topics:
+            from fastmcp.server.events import EventsCapability
+
+            capabilities.events = EventsCapability(
+                topics=list(self.fastmcp._event_topics.values()),
+            )
+        else:
+            # No topics declared: suppress events capability
+            capabilities.events = None
+
         # Advertise MCP Apps extension support (io.modelcontextprotocol/ui)
-        # Uses the same extra-field pattern as tasks above — ServerCapabilities
+        # Uses the same extra-field pattern as tasks above -- ServerCapabilities
         # has extra="allow" so this survives serialization.
         # Merge with any existing extensions to avoid clobbering other features.
         existing_extensions: dict[str, Any] = (
@@ -245,18 +273,30 @@ class LowLevelServer(_Server[LifespanResultT, RequestT]):
                 )
             )
 
-            async with anyio.create_task_group() as tg:
-                # Store task group on session for subscription tasks (SEP-1686)
-                session._subscription_task_group = tg
+            # Register session for event broadcasting (dict for O(1) lookup)
+            from uuid import uuid4
 
-                async for message in session.incoming_messages:
-                    tg.start_soon(
-                        self._handle_message,
-                        message,
-                        session,
-                        lifespan_context,
-                        raise_exceptions,
-                    )
+            session_id = str(uuid4())
+            session._fastmcp_event_session_id = session_id
+            self.fastmcp._active_sessions[session_id] = session
+
+            try:
+                async with anyio.create_task_group() as tg:
+                    # Store task group on session for subscription tasks (SEP-1686)
+                    session._subscription_task_group = tg
+
+                    async for message in session.incoming_messages:
+                        tg.start_soon(
+                            self._handle_message,
+                            message,
+                            session,
+                            lifespan_context,
+                            raise_exceptions,
+                        )
+            finally:
+                # Cleanup: remove session and its subscriptions
+                self.fastmcp._active_sessions.pop(session_id, None)
+                await self.fastmcp._subscription_registry.remove_all(session_id)
 
     def read_resource(
         self,
